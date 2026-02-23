@@ -35,7 +35,9 @@ dev = [
 ]
 
 [project.scripts]
-pipeliner = "pipeliner.cli:main"
+pipeliner = "pipeliner.webapp:main"
+pipeliner-cli = "pipeliner.cli:main"
+pipeliner-web = "pipeliner.webapp:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,40 +1,133 @@
+version: 1
+
+# Single source of truth for pipeline variability and path templates.
+# Templates use ${var_name} placeholders.
+
 variation_points:
-  dataset_name:
-    kickoff:
-      dataset_variants: [flat, circled]
-    pretest_snaketool_leg4A:
-      dataset_variants: [flat]
-  dataset_variant: [flat, circled]
-  algo_name: [patchcore, dinomaly]
-  repair_method: [LaMa]
-  mask_type: [manually_re_masked_thicker]
-  tiling: [whole, 256_s128]
-  experiment_name: [experiment1_]
+  values:
+    - name: dataset_name
+      gui:
+        display_name: Dataset
+      options:
+        - name: kickoff
+          values: [flat, circled]
+        - name: pretest_snaketool_leg4A
+          values: [flat]
+
+    - name: algo_name
+      gui:
+        display_name: Algorithm
+      values: [patchcore, dinomaly]
+
+    - name: repair_method
+      gui:
+        display_name: Repair Method
+      values: [LaMa]
+
+    - name: mask_type
+      gui:
+        display_name: Mask Type
+      values:
+        - re_masked_thicker
+        - re_masked_thinner
+        - manually_re_masked_thicker
+
+    - name: tiling
+      gui:
+        display_name: Tiling
+      values: [whole, 256_s128]
+
+    - name: experiment_name
+      gui:
+        display_name: Experiment Name
+      values: [experiment1_]
 
 process_steps:
-  A30_mask:
-    script: "pipeline/manual_steps.py"
-    kind: manual
-    input: "pipeline_data/A20_cut_out/${dataset_name}/${dataset_variant}"
-    output: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
+  gui:
+    enumerate: true
+  values:
+    - name: A10_augment
+      script: "pipeline/manual_steps.py"
+      kind: manual
+      runtime:
+        conda_env: anomalib
+      input_from_previous: false
+      input: "input/${dataset_name}/${dataset_variant}"
+      output: "pipeline_data/${process_step}/${dataset_name}/${dataset_variant}"
 
-  A40_repair:
-    script: "pipeline/A40_repair.py"
-    kind: automated
-    input: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
-    output: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
+    - name: A15_colorize
+      gui:
+        display_name: "A15_colorize (only if dataset is grayscale)"
+      script: "pipeline/manual_steps.py"
+      kind: manual
+      runtime:
+        conda_env: anomalib
+      input_from_previous: false
+      input: "input/${dataset_name}/${dataset_variant}"
+      output: "pipeline_data/${process_step}/${dataset_name}/${dataset_variant}"
 
-  B10_structure_ds_for_algo:
-    script: "pipeline/${algo_name}/B10_structure_ds_for_algo.py"
-    kind: automated
-    input:
-      repaired: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
-      masks: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
-      known_bad: "input/${dataset_name}/known_bad"
-    output: "pipeline_data/${algo_name}/B10_structure_ds_for_algo/${dataset_name}/${dataset_variant}/${repair_method}/${mask_type}"
+    - name: A20_cut_out
+      script: "pipeline/manual_steps.py"
+      kind: manual
+      runtime:
+        conda_env: anomalib
+      input_from_previous: true
+      previous_step: A15_colorize
+      output: "pipeline_data/${process_step}/${dataset_name}/${dataset_variant}"
 
-  B20_train:
-    script: "pipeline/${algo_name}/B20_train.py"
-    kind: automated
-    input: "pipeline_data/${algo_name}/B10_structure_ds_for_algo/${dataset_name}/${dataset_variant}/${repair_method}/${mask_type}"
-    output: "pipeline_data/${algo_name}/B20_train/${dataset_name}/${dataset_variant}/${experiment_name}/${tiling}"
+    - name: A30_mask
+      script: "pipeline/manual_steps.py"
+      kind: manual
+      runtime:
+        conda_env: masker-app
+      input_from_previous: true
+      previous_step: A20_cut_out
+      output: "pipeline_data/${process_step}/${dataset_name}/${dataset_variant}/${mask_type}"
+
+    - name: A40_repair
+      script: "pipeline/${process_step}.py"
+      kind: automated
+      runtime:
+        conda_env: lama-inpainting
+      input_from_previous: true
+      previous_step: A30_mask
+      output: "pipeline_data/${process_step}/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
+
+    - name: B10_structure_ds_for_algo
+      script: "pipeline/${algo_name}/${process_step}.py"
+      kind: automated
+      runtime:
+        conda_env: anomalib
+      input_from_previous: false
+      input:
+        repaired: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
+        masks: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
+        known_bad: "input/${dataset_name}/known_bad"
+      output: "pipeline_data/${algo_name}/${process_step}/${dataset_name}/${dataset_variant}/${repair_method}/${mask_type}"
+
+    - name: B20_train
+      script: "pipeline/${algo_name}/${process_step}.py"
+      kind: automated
+      runtime:
+        conda_env: anomalib
+      input_from_previous: true
+      previous_step: B10_structure_ds_for_algo
+      output: "pipeline_data/${algo_name}/${process_step}/${dataset_name}/${dataset_variant}/${experiment_name}/${tiling}"
+
+    - name: C10_infer
+      script: "pipeline/${algo_name}/${process_step}.py"
+      kind: automated
+      runtime:
+        conda_env: anomalib
+      input_from_previous: true
+      previous_step: B20_train
+      output: "pipeline_data/${algo_name}/${process_step}/${dataset_name}/${dataset_variant}/${experiment_name}/${tiling}"
+
+    - name: C20_evaluate
+      script: "pipeline/${algo_name}/${process_step}.py"
+      kind: automated
+      runtime:
+        conda_env: anomalib
+      input_from_previous: true
+      previous_step: C10_infer
+      output: "pipeline_data/${algo_name}/${process_step}/${dataset_name}/${dataset_variant}/${experiment_name}/${tiling}"
