@@ -1,0 +1,38 @@
+{% set name = "pipeliner" %}
+{% set version = "0.1.0a0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - setuptools >=69
+    - wheel
+  run:
+    - python >=3.10
+    - pyyaml >=6.0
+
+test:
+  imports:
+    - pipeliner
+  commands:
+    - pipeliner --help
+
+about:
+  home: https://github.com/RISE/pipeliner
+  summary: YAML-driven experiment pipeline multiplexer
+  license: Proprietary
+
+extra:
+  recipe-maintainers:
+    - your-github-handle

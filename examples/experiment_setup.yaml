@@ -1,0 +1,40 @@
+variation_points:
+  dataset_name:
+    kickoff:
+      dataset_variants: [flat, circled]
+    pretest_snaketool_leg4A:
+      dataset_variants: [flat]
+  dataset_variant: [flat, circled]
+  algo_name: [patchcore, dinomaly]
+  repair_method: [LaMa]
+  mask_type: [manually_re_masked_thicker]
+  tiling: [whole, 256_s128]
+  experiment_name: [experiment1_]
+
+process_steps:
+  A30_mask:
+    script: "pipeline/manual_steps.py"
+    kind: manual
+    input: "pipeline_data/A20_cut_out/${dataset_name}/${dataset_variant}"
+    output: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
+
+  A40_repair:
+    script: "pipeline/A40_repair.py"
+    kind: automated
+    input: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
+    output: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
+
+  B10_structure_ds_for_algo:
+    script: "pipeline/${algo_name}/B10_structure_ds_for_algo.py"
+    kind: automated
+    input:
+      repaired: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
+      masks: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
+      known_bad: "input/${dataset_name}/known_bad"
+    output: "pipeline_data/${algo_name}/B10_structure_ds_for_algo/${dataset_name}/${dataset_variant}/${repair_method}/${mask_type}"
+
+  B20_train:
+    script: "pipeline/${algo_name}/B20_train.py"
+    kind: automated
+    input: "pipeline_data/${algo_name}/B10_structure_ds_for_algo/${dataset_name}/${dataset_variant}/${repair_method}/${mask_type}"
+    output: "pipeline_data/${algo_name}/B20_train/${dataset_name}/${dataset_variant}/${experiment_name}/${tiling}"

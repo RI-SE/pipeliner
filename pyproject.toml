@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipeliner"
+version = "0.1.0a0"
+description = "YAML-driven experiment pipeline multiplexer"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "RISE" }
+]
+license = { text = "Proprietary" }
+keywords = ["pipeline", "experiments", "mlops", "runner", "yaml"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent"
+]
+dependencies = [
+  "PyYAML>=6.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "build>=1.2",
+  "twine>=5.0"
+]
+
+[project.scripts]
+pipeliner = "pipeliner.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
