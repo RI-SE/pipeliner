@@ -98,6 +98,8 @@ process_steps:
       kind: automated
       runtime:
         conda_env: anomalib
+      test_ratio: 0.2
+      test_seed: 42
       input_from_previous: false
       input:
         repaired: "pipeline_data/A40_repair/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"

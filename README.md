@@ -7,8 +7,8 @@ It resolves variation points, expands step templates, and builds a runnable cont
 ## Core idea
 
 You define:
-- `variation_points`: what can vary (dataset, algorithm, tiling, etc.)
-- `process_steps`: ordered steps with templated `script`, `input`, `output`
+- `variation_points.values`: ordered variation definitions (`name`, `values` or `options`)
+- `process_steps.values`: ordered step definitions (`name`, templated `script`, `input`, `output`)
 
 Then `pipeliner` resolves one concrete combination and produces:
 - fully expanded paths
@@ -18,36 +18,50 @@ Then `pipeliner` resolves one concrete combination and produces:
 
 Step scripts stay simple: parse contract JSON, validate inputs, run, write outputs/logs.
 
-## Example: 3 steps, 2 variation points
+The full web UI (Viewer/Runner/Analysis, run/cancel, runner plan, trees) is now part of the package.
+Consumer repos can keep a thin compatibility wrapper at `pipeline/config_webapp.py`.
 
-`example_setup.yaml`:
+## Example YAML schema (ordered list style)
+
+`examples/experiment_setup.yaml`:
 
 ```yaml
 variation_points:
-  dataset: [setA, setB]
-  algo: [patchcore, dinomaly]
+  values:
+    - name: dataset_name
+      gui:
+        display_name: Dataset
+      options:
+        - name: kickoff
+          values: [flat, circled]
+        - name: pretest_snaketool_leg4A
+          values: [flat]
+
+    - name: algo_name
+      values: [patchcore, dinomaly]
 
 process_steps:
-  S10_prepare:
-    script: "steps/S10_prepare.py"
-    input: "input/${dataset}"
-    output: "pipeline_data/S10_prepare/${dataset}"
+  gui:
+    enumerate: true
+  values:
+    - name: A30_mask
+      script: "pipeline/manual_steps.py"
+      kind: manual
+      input: "pipeline_data/A20_cut_out/${dataset_name}/${dataset_variant}"
+      output: "pipeline_data/A30_mask/${dataset_name}/${dataset_variant}/${mask_type}"
 
-  S20_train:
-    script: "steps/${algo}/S20_train.py"
-    input: "pipeline_data/S10_prepare/${dataset}"
-    output: "pipeline_data/${algo}/S20_train/${dataset}"
-
-  S30_eval:
-    script: "steps/${algo}/S30_eval.py"
-    input: "pipeline_data/${algo}/S20_train/${dataset}"
-    output: "pipeline_data/${algo}/S30_eval/${dataset}"
+    - name: A40_repair
+      script: "pipeline/${process_step}.py"
+      kind: automated
+      input_from_previous: true
+      previous_step: A30_mask
+      output: "pipeline_data/${process_step}/${repair_method}/${mask_type}/${dataset_name}/${dataset_variant}"
 ```
 
-If you select `dataset=setA` and `algo=patchcore`, `S20_train` resolves to:
-- script: `steps/patchcore/S20_train.py`
-- input: `pipeline_data/S10_prepare/setA`
-- output: `pipeline_data/patchcore/S20_train/setA`
+If you select `dataset_name=kickoff`, `dataset_variant=circled`, `algo_name=patchcore`:
+- `script` templates are expanded with selected values
+- relative paths are resolved from project root inferred from config path
+- each step gets one `--contract-json` payload
 
 ## Contract model
 
@@ -72,10 +86,16 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 
 pipeliner --help
-pipeliner list --setup examples/experiment_setup.yaml
-pipeliner show --setup examples/experiment_setup.yaml --step A40_repair --set dataset_name=kickoff --set dataset_variant=circled --set algo_name=patchcore
-pipeliner-web --setup examples/experiment_setup.yaml --host 127.0.0.1 --port 8765
+pipeliner --port 8080 --config /path/to/opticap-qai/pipeline/experiment_setup.yaml
+
+# Optional CLI helper commands
+pipeliner-cli list --setup examples/experiment_setup.yaml
+pipeliner-cli show --setup examples/experiment_setup.yaml --step A40_repair --set dataset_name=kickoff --set dataset_variant=circled --set algo_name=patchcore
 ```
+
+Run from any working directory:
+- pass absolute/relative `--config`
+- project root defaults to config parent (or parent of `pipeline/` when config is `pipeline/experiment_setup.yaml`)
 
 ## Packaging
 
