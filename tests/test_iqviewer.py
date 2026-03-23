@@ -4,7 +4,7 @@ import csv
 import json
 from pathlib import Path
 
-from pipeliner.iqviewer import _load_quality_tab
+from pipeliner.iqviewer import _auto_tune_quality_thresholds, _load_quality_tab
 from pipeliner.setup_loader import load_setup
 
 
@@ -143,3 +143,69 @@ process_steps:
     assert tab["rows"][0]["source_crop_size"] is None
     assert tab["rows"][0]["source_crop_box_clipped"] == ""
     assert tab["rows"][0]["target_size"] is None
+
+
+def test_auto_tune_quality_thresholds_uses_manual_labels_and_respects_enabled_checks() -> None:
+    result = _auto_tune_quality_thresholds(
+        [
+            {
+                "imgpath": "img_a.png",
+                "final_status": "FAIL",
+                "lap_var": 10,
+                "brisque": 10,
+                "niqe": 1,
+                "mean": 120,
+                "std": 30,
+                "black_clip": 0.01,
+                "white_clip": 0.01,
+            },
+            {
+                "imgpath": "img_b.png",
+                "final_status": "FAIL",
+                "lap_var": 20,
+                "brisque": 12,
+                "niqe": 1.5,
+                "mean": 125,
+                "std": 28,
+                "black_clip": 0.02,
+                "white_clip": 0.02,
+            },
+            {
+                "imgpath": "img_c.png",
+                "final_status": "PASS",
+                "lap_var": 80,
+                "brisque": 14,
+                "niqe": 2,
+                "mean": 130,
+                "std": 35,
+                "black_clip": 0.03,
+                "white_clip": 0.03,
+            },
+            {
+                "imgpath": "img_d.png",
+                "final_status": "PASS",
+                "lap_var": 100,
+                "brisque": 16,
+                "niqe": 2.5,
+                "mean": 135,
+                "std": 36,
+                "black_clip": 0.04,
+                "white_clip": 0.04,
+            },
+        ],
+        {
+            "laplacian_pass": True,
+            "brisque_pass": False,
+            "niqe_pass": False,
+            "darkness_pass": False,
+            "brightness_pass": False,
+            "contrast_pass": False,
+            "black_clip_pass": False,
+            "white_clip_pass": False,
+        },
+    )
+
+    assert "lapl_blur_threshold" in result["thresholds"]
+    assert "brisque_threshold" not in result["thresholds"]
+    assert result["report"]["accuracy"] == 1.0
+    assert result["report"]["pass_rate"] == 0.5

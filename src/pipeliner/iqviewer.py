@@ -748,6 +748,100 @@ def _parse_positive_int_or_default(raw: Any, default: int) -> int:
     return value if value > 0 else default
 
 
+QUALITY_AUTO_TUNE_SPECS: tuple[dict[str, str], ...] = (
+    {"metric": "lap_var", "source": "lap_var", "direction": "low_is_bad", "check": "laplacian_pass", "threshold_key": "lapl_blur_threshold"},
+    {"metric": "brisque", "source": "brisque", "direction": "high_is_bad", "check": "brisque_pass", "threshold_key": "brisque_threshold"},
+    {"metric": "niqe", "source": "niqe", "direction": "high_is_bad", "check": "niqe_pass", "threshold_key": "niqe_threshold"},
+    {"metric": "mean_darkness", "source": "mean", "direction": "low_is_bad", "check": "darkness_pass", "threshold_key": "darkness_threshold"},
+    {"metric": "mean_brightness", "source": "mean", "direction": "high_is_bad", "check": "brightness_pass", "threshold_key": "brightness_threshold"},
+    {"metric": "std", "source": "std", "direction": "low_is_bad", "check": "contrast_pass", "threshold_key": "contrast_threshold"},
+    {"metric": "black_clip", "source": "black_clip", "direction": "high_is_bad", "check": "black_clip_pass", "threshold_key": "black_clip_threshold"},
+    {"metric": "white_clip", "source": "white_clip", "direction": "high_is_bad", "check": "white_clip_pass", "threshold_key": "white_clip_threshold"},
+)
+
+
+def _auto_tune_quality_thresholds(
+    rows: list[dict[str, Any]],
+    enabled_checks: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not rows:
+        return {"thresholds": {}, "report": {"combine": "AND", "pass_rate": 1.0}, "violations": {"per_rule": {}, "overall": []}}
+
+    import importlib.util
+    import types
+
+    for optional_module in ("numexpr", "bottleneck"):
+        if optional_module not in sys.modules:
+            stub = types.ModuleType(optional_module)
+            stub.__version__ = "0.0"
+            sys.modules[optional_module] = stub
+
+    try:
+        import pandas as pd
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("pandas is required for quality auto tuning.") from exc
+
+    tuner_path = Path(__file__).resolve().parents[3] / "pipeline" / "image_base_quality" / "img_quality_param_auto_tuning.py"
+    spec = importlib.util.spec_from_file_location("iqviewer_quality_auto_tuning", tuner_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load quality auto tuning module from {tuner_path}.")
+    tuner_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tuner_module)
+    fit_quality_thresholds = tuner_module.fit_quality_thresholds
+
+    active_specs = [
+        spec
+        for spec in QUALITY_AUTO_TUNE_SPECS
+        if not isinstance(enabled_checks, dict) or enabled_checks.get(spec["check"], True) is not False
+    ]
+    if not active_specs:
+        return {"thresholds": {}, "report": {"combine": "AND", "pass_rate": 1.0}, "violations": {"per_rule": {}, "overall": []}}
+
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        record: dict[str, Any] = {
+            "imgpath": str(row.get("imgpath") or row.get("path") or row.get("name") or f"row_{idx}").strip() or f"row_{idx}",
+            "final_status": str(row.get("final_status", "PASS")).strip().upper() or "PASS",
+        }
+        for spec in active_specs:
+            record[spec["metric"]] = _parse_float(row.get(spec["source"]))
+        records.append(record)
+
+    if not records:
+        raise ValueError("No valid quality rows were provided for auto tuning.")
+
+    df = pd.DataFrame.from_records(records)
+    metrics = [spec["metric"] for spec in active_specs if spec["metric"] in df.columns]
+    if not metrics:
+        return {"thresholds": {}, "report": {"combine": "AND", "pass_rate": 1.0}, "violations": {"per_rule": {}, "overall": []}}
+    directions = {spec["metric"]: spec["direction"] for spec in active_specs if spec["metric"] in metrics}
+    thresholds, report, violations = fit_quality_thresholds(
+        df,
+        metrics=metrics,
+        directions=directions,
+        combine="AND",
+        use_labels=True,
+        label_col="final_status",
+        label_pass_value="PASS",
+        strategy="youden",
+        id_col="imgpath",
+    )
+
+    threshold_overrides: dict[str, float] = {}
+    for spec in active_specs:
+        threshold_value = thresholds.get(spec["metric"], {}).get("threshold")
+        if not isinstance(threshold_value, (int, float)) or not math.isfinite(threshold_value):
+            continue
+        threshold_overrides[spec["threshold_key"]] = float(threshold_value)
+    return {
+        "thresholds": threshold_overrides,
+        "report": report,
+        "violations": violations,
+    }
+
+
 def _quality_fail_reasons(row: dict[str, str]) -> list[str]:
     reasons: list[str] = []
     checks = [
@@ -1452,6 +1546,13 @@ HTML = """<!doctype html>
       text-transform: uppercase;
       white-space: nowrap;
     }
+    .status-btn {
+      border: 0;
+      cursor: pointer;
+    }
+    .status-btn.status-manual {
+      box-shadow: inset 0 0 0 1px rgba(16, 24, 40, 0.18);
+    }
     .status-pass {
       background: #dff5e8;
       color: #146c43;
@@ -1739,6 +1840,8 @@ HTML = """<!doctype html>
     let QUALITY_FILTER = "all";
     let QUALITY_THRESHOLD_OVERRIDES = {};
     let QUALITY_MEASURE_OVERRIDES = {};
+    let QUALITY_STATUS_OVERRIDES = {};
+    let QUALITY_TUNING_REPORTS = {};
     let ORIGINAL_SEGMENT_SIM_OVERRIDES = {};
     let zoomState = { scale: 1, x: 0, y: 0, dragging: false, startX: 0, startY: 0 };
 
@@ -1749,6 +1852,20 @@ HTML = """<!doctype html>
     async function fetchJson(url) {
       const response = await fetch(url, { cache: "no-store" });
       return await response.json();
+    }
+
+    async function postJson(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `Request failed with status ${response.status}`);
+      }
+      return data;
     }
 
     function currentQuery() {
@@ -1886,21 +2003,22 @@ HTML = """<!doctype html>
       return String(value);
     }
 
-    function createQualityCard(item) {
+    function createQualityCard(item, tab) {
       const card = document.createElement("div");
       card.className = "thumb-card";
       card.title = item.title || "";
-      const statusClass = item.computed.status === "PASS" ? "status-pass" : item.computed.status === "FAIL" ? "status-fail" : "status-unknown";
+      const labelStatus = qualityLabelStatus(item, tab);
+      const statusClass = labelStatus === "PASS" ? "status-pass" : labelStatus === "FAIL" ? "status-fail" : "status-unknown";
       const reasons = (item.computed.fail_reasons || []).map(reason => `<span class="reason-pill">${reason}</span>`).join("");
       const checks = item.computed.checks || {};
+      const computedClass = item.computed.status === "PASS" ? "status-pass" : item.computed.status === "FAIL" ? "status-fail" : "status-unknown";
+      const showComputedStatus = labelStatus !== item.computed.status;
       const metricClass = (passFlag) => {
         if (passFlag === null || passFlag === undefined) return "metric-neutral";
         return passFlag ? "metric-ok" : "metric-bad";
       };
       const meanClass = (checks.darkness_pass === false || checks.brightness_pass === false) ? "metric-bad" : "metric-ok";
-      const targetSize = formatSize(item.target_size);
       const sourceCropSize = formatSize(item.source_crop_size || item.image_size);
-      const sourceCropBoxClipped = formatValue(item.source_crop_box_clipped);
       card.innerHTML = `
         <div class="thumb-img-wrap">
           <img class="thumb-img" loading="lazy" src="${item.image_url}" alt="${item.name}" />
@@ -1909,11 +2027,15 @@ HTML = """<!doctype html>
         <div class="thumb-body">
           <div class="thumb-header">
             <div class="thumb-title">${item.name}</div>
-            <span class="status-pill ${statusClass}">${item.computed.status}</span>
+            <div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;">
+              <button type="button" class="status-pill status-btn ${statusClass}${showComputedStatus ? " status-manual" : ""}">${labelStatus}</button>
+              ${showComputedStatus ? `<span class="status-pill ${computedClass}">Sim ${item.computed.status}</span>` : ""}
+            </div>
           </div>
           <div class="metric-list">
             <div class="${metricClass(checks.laplacian_pass)}"><strong>Lap</strong> ${formatMetric(item.metrics.lap_var)}</div>
             <div class="${metricClass(checks.brisque_pass)}"><strong>BRISQUE</strong> ${formatMetric(item.metrics.brisque)}</div>
+            <div class="${metricClass(checks.niqe_pass)}"><strong>NIQE</strong> ${formatMetric(item.metrics.niqe)}</div>
             <div class="${meanClass}"><strong>Mean</strong> ${formatMetric(item.metrics.mean)}</div>
             <div class="${metricClass(checks.contrast_pass)}"><strong>Std</strong> ${formatMetric(item.metrics.std)}</div>
             <div class="${metricClass(checks.black_clip_pass)}"><strong>Black</strong> ${formatMetric(item.metrics.black_clip, 2, true)}</div>
@@ -1921,8 +2043,6 @@ HTML = """<!doctype html>
           </div>
           ${reasons ? `<div class="reason-list">${reasons}</div>` : ""}
           <div class="size-line"><strong>Source crop size</strong> ${sourceCropSize}</div>
-          <div class="size-line"><strong>Target size</strong> ${targetSize}</div>
-          <div class="size-line"><strong>Source crop box clipped</strong> ${sourceCropBoxClipped}</div>
         </div>
       `;
       const image = card.querySelector(".thumb-img");
@@ -1930,6 +2050,22 @@ HTML = """<!doctype html>
       if (image && imageWrap) {
         image.addEventListener("error", () => {
           imageWrap.classList.add("error");
+        });
+      }
+      const statusBtn = card.querySelector(".status-btn");
+      if (statusBtn) {
+        statusBtn.addEventListener("click", event => {
+          event.stopPropagation();
+          const key = item.path || item.name;
+          const overrides = currentQualityStatusOverrides(tab);
+          const currentStatus = qualityLabelStatus(item, tab);
+          const nextStatus = currentStatus === "PASS" ? "FAIL" : "PASS";
+          if (nextStatus === item.computed.status) {
+            delete overrides[key];
+          } else {
+            overrides[key] = nextStatus;
+          }
+          renderContent();
         });
       }
       card.addEventListener("click", () => openModal(item.full_url, item.name));
@@ -1959,6 +2095,14 @@ HTML = """<!doctype html>
         };
       }
       return QUALITY_MEASURE_OVERRIDES[tab.id];
+    }
+
+    function currentQualityStatusOverrides(tab) {
+      if (!tab) return {};
+      if (!QUALITY_STATUS_OVERRIDES[tab.id]) {
+        QUALITY_STATUS_OVERRIDES[tab.id] = {};
+      }
+      return QUALITY_STATUS_OVERRIDES[tab.id];
     }
 
     function setThresholdInputState(currentTab) {
@@ -2027,13 +2171,42 @@ HTML = """<!doctype html>
       };
     }
 
+    function qualityLabelStatus(row, tab) {
+      const key = row.path || row.name;
+      const overrides = currentQualityStatusOverrides(tab);
+      return overrides[key] || row.computed.status;
+    }
+
     function simulatedQualityRows(tab) {
       const thresholds = currentQualityThresholds(tab);
       const enabledChecks = currentQualityMeasures(tab);
+      const overrides = currentQualityStatusOverrides(tab);
       return (tab.rows || []).map(row => ({
         ...row,
         computed: classifyQualityRow(row, thresholds, enabledChecks),
+        label_status: overrides[row.path || row.name] || null,
       }));
+    }
+
+    function syncQualityControls(currentTab) {
+      const thresholds = currentQualityThresholds(currentTab);
+      const enabledChecks = currentQualityMeasures(currentTab);
+      thresholds.lapl_blur_threshold = parseThresholdValue(el("thr_lap")?.value, thresholds.lapl_blur_threshold);
+      thresholds.brisque_threshold = parseThresholdValue(el("thr_brisque")?.value, thresholds.brisque_threshold);
+      thresholds.niqe_threshold = parseThresholdValue(el("thr_niqe")?.value, thresholds.niqe_threshold);
+      thresholds.darkness_threshold = parseThresholdValue(el("thr_dark")?.value, thresholds.darkness_threshold);
+      thresholds.brightness_threshold = parseThresholdValue(el("thr_bright")?.value, thresholds.brightness_threshold);
+      thresholds.contrast_threshold = parseThresholdValue(el("thr_contrast")?.value, thresholds.contrast_threshold);
+      thresholds.black_clip_threshold = parseThresholdValue(el("thr_black")?.value, thresholds.black_clip_threshold);
+      thresholds.white_clip_threshold = parseThresholdValue(el("thr_white")?.value, thresholds.white_clip_threshold);
+      enabledChecks.laplacian_pass = !!el("chk_lap")?.checked;
+      enabledChecks.brisque_pass = !!el("chk_brisque")?.checked;
+      enabledChecks.niqe_pass = !!el("chk_niqe")?.checked;
+      enabledChecks.darkness_pass = !!el("chk_dark")?.checked;
+      enabledChecks.brightness_pass = !!el("chk_bright")?.checked;
+      enabledChecks.contrast_pass = !!el("chk_contrast")?.checked;
+      enabledChecks.black_clip_pass = !!el("chk_black")?.checked;
+      enabledChecks.white_clip_pass = !!el("chk_white")?.checked;
     }
 
     function renderOriginalSegmentsTab(tab) {
@@ -2122,8 +2295,8 @@ HTML = """<!doctype html>
       const thresholds = currentQualityThresholds(tab);
       const enabledChecks = currentQualityMeasures(tab);
       const rows = simulatedQualityRows(tab);
-      const passCount = rows.filter(row => row.computed.status === "PASS").length;
-      const failCount = rows.filter(row => row.computed.status === "FAIL").length;
+      const passCount = rows.filter(row => qualityLabelStatus(row, tab) === "PASS").length;
+      const failCount = rows.filter(row => qualityLabelStatus(row, tab) === "FAIL").length;
       const thresholdBits = [
         thresholds.lapl_blur_threshold !== undefined ? `lap >= ${formatMetric(thresholds.lapl_blur_threshold)}` : "",
         thresholds.brisque_threshold !== undefined ? `brisque <= ${formatMetric(thresholds.brisque_threshold)}` : "",
@@ -2134,17 +2307,12 @@ HTML = """<!doctype html>
         thresholds.black_clip_threshold !== undefined ? `black <= ${formatMetric(thresholds.black_clip_threshold, 2, true)}` : "",
         thresholds.white_clip_threshold !== undefined ? `white <= ${formatMetric(thresholds.white_clip_threshold, 2, true)}` : "",
       ].filter(Boolean).join(" | ");
+      const tuningReport = QUALITY_TUNING_REPORTS[tab.id];
       return `
-        <div class="meta-row">
-          <span class="k">CSV</span>
-          <span class="v path">${tab.csv_path_display || tab.csv_path}</span>
-        </div>
         <div class="meta-inline">
           <span class="meta-chip">Rows ${rows.length}</span>
           <span class="meta-chip">PASS ${passCount}</span>
           <span class="meta-chip">FAIL ${failCount}</span>
-          <span class="meta-chip">Source ${Array.from(new Set(rows.map(row => formatSize(row.source_crop_size || row.image_size)).filter(value => value !== "unknown"))).join(", ") || "unknown"}</span>
-          <span class="meta-chip">Target ${Array.from(new Set(rows.map(row => formatSize(row.target_size)).filter(value => value !== "unknown"))).join(", ") || "unknown"}</span>
         </div>
         <div class="threshold-section-title">Blur Thresholds</div>
         <div class="threshold-grid">
@@ -2162,12 +2330,14 @@ HTML = """<!doctype html>
         </div>
         <div class="simulate-row">
           <button type="button" id="simulate_btn" class="simulate-btn">Simulate</button>
+          <button type="button" id="auto_tune_btn" class="simulate-btn">Auto Tune</button>
         </div>
         <div class="toolbar">
           <button type="button" class="filter-btn" data-quality-filter="all">All</button>
           <button type="button" class="filter-btn" data-quality-filter="fail">Only FAIL</button>
           <button type="button" class="filter-btn" data-quality-filter="pass">Only PASS</button>
         </div>
+        ${tuningReport ? `<div class="empty" style="margin-bottom:14px;">Auto tune: pass rate ${formatMetric(tuningReport.pass_rate)}${tuningReport.accuracy !== undefined ? ` | accuracy ${formatMetric(tuningReport.accuracy)}` : ""}</div>` : ""}
         ${thresholdBits ? `<div class="empty" style="margin-bottom:14px;">Thresholds: ${thresholdBits}</div>` : ""}
         <div id="quality_grid" class="thumb-grid"></div>
       `;
@@ -2234,12 +2404,12 @@ HTML = """<!doctype html>
       if (qualityGrid) {
         const rows = simulatedQualityRows(currentTab);
         const filtered = rows.filter(item => {
-          if (QUALITY_FILTER === "fail") return item.computed.status === "FAIL";
-          if (QUALITY_FILTER === "pass") return item.computed.status === "PASS";
+          if (QUALITY_FILTER === "fail") return qualityLabelStatus(item, currentTab) === "FAIL";
+          if (QUALITY_FILTER === "pass") return qualityLabelStatus(item, currentTab) === "PASS";
           return true;
         });
         if (filtered.length) {
-          filtered.forEach(item => qualityGrid.appendChild(createQualityCard(item)));
+          filtered.forEach(item => qualityGrid.appendChild(createQualityCard(item, currentTab)));
         } else {
           qualityGrid.innerHTML = '<div class="empty">No images match the current filter.</div>';
         }
@@ -2280,25 +2450,36 @@ HTML = """<!doctype html>
         const simulateBtn = el("simulate_btn");
         if (simulateBtn) {
           simulateBtn.addEventListener("click", () => {
-            const thresholds = currentQualityThresholds(currentTab);
-            const enabledChecks = currentQualityMeasures(currentTab);
-            thresholds.lapl_blur_threshold = parseThresholdValue(el("thr_lap")?.value, thresholds.lapl_blur_threshold);
-            thresholds.brisque_threshold = parseThresholdValue(el("thr_brisque")?.value, thresholds.brisque_threshold);
-            thresholds.niqe_threshold = parseThresholdValue(el("thr_niqe")?.value, thresholds.niqe_threshold);
-            thresholds.darkness_threshold = parseThresholdValue(el("thr_dark")?.value, thresholds.darkness_threshold);
-            thresholds.brightness_threshold = parseThresholdValue(el("thr_bright")?.value, thresholds.brightness_threshold);
-            thresholds.contrast_threshold = parseThresholdValue(el("thr_contrast")?.value, thresholds.contrast_threshold);
-            thresholds.black_clip_threshold = parseThresholdValue(el("thr_black")?.value, thresholds.black_clip_threshold);
-            thresholds.white_clip_threshold = parseThresholdValue(el("thr_white")?.value, thresholds.white_clip_threshold);
-            enabledChecks.laplacian_pass = !!el("chk_lap")?.checked;
-            enabledChecks.brisque_pass = !!el("chk_brisque")?.checked;
-            enabledChecks.niqe_pass = !!el("chk_niqe")?.checked;
-            enabledChecks.darkness_pass = !!el("chk_dark")?.checked;
-            enabledChecks.brightness_pass = !!el("chk_bright")?.checked;
-            enabledChecks.contrast_pass = !!el("chk_contrast")?.checked;
-            enabledChecks.black_clip_pass = !!el("chk_black")?.checked;
-            enabledChecks.white_clip_pass = !!el("chk_white")?.checked;
+            syncQualityControls(currentTab);
             renderContent();
+          });
+        }
+        const autoTuneBtn = el("auto_tune_btn");
+        if (autoTuneBtn) {
+          autoTuneBtn.addEventListener("click", async () => {
+            syncQualityControls(currentTab);
+            const originalLabel = autoTuneBtn.textContent;
+            autoTuneBtn.disabled = true;
+            autoTuneBtn.textContent = "Tuning...";
+            try {
+              const rowsForTuning = simulatedQualityRows(currentTab).map(row => ({
+                imgpath: row.path || row.name,
+                final_status: qualityLabelStatus(row, currentTab),
+                ...(row.metrics || {}),
+              }));
+              const payload = await postJson("/api/quality/auto_tune", {
+                rows: rowsForTuning,
+                enabled_checks: currentQualityMeasures(currentTab),
+              });
+              Object.assign(currentQualityThresholds(currentTab), payload.thresholds || {});
+              QUALITY_TUNING_REPORTS[currentTab.id] = payload.report || null;
+              renderContent();
+            } catch (err) {
+              window.alert(`Auto tuning failed: ${err}`);
+            } finally {
+              autoTuneBtn.disabled = false;
+              autoTuneBtn.textContent = originalLabel;
+            }
           });
         }
       }
@@ -2334,6 +2515,8 @@ HTML = """<!doctype html>
       }
       QUALITY_FILTER = "all";
       ORIGINAL_SEGMENT_SIM_OVERRIDES = {};
+      QUALITY_STATUS_OVERRIDES = {};
+      QUALITY_TUNING_REPORTS = {};
       renderTabs();
       renderContent();
     }
@@ -2415,6 +2598,22 @@ class IQViewerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stdout.write("[iqviewer] " + (format % args) + "\n")
+
+    def _read_json_body(self) -> dict[str, Any]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            raise ValueError("Invalid Content-Length header.") from None
+        if content_length <= 0:
+            raise ValueError("Missing request body.")
+        raw = self.rfile.read(content_length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Invalid JSON body: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -2532,6 +2731,28 @@ class IQViewerHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/quality/auto_tune":
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        try:
+            payload = self._read_json_body()
+            rows = payload.get("rows", [])
+            enabled_checks = payload.get("enabled_checks", {})
+            if not isinstance(rows, list):
+                raise ValueError("'rows' must be a list.")
+            if enabled_checks is not None and not isinstance(enabled_checks, dict):
+                raise ValueError("'enabled_checks' must be an object.")
+            result = _auto_tune_quality_thresholds(rows, enabled_checks if isinstance(enabled_checks, dict) else None)
+        except ValueError as exc:
+            _error_response(self, str(exc), HTTPStatus.BAD_REQUEST)
+            return
+        except Exception as exc:  # noqa: BLE001
+            _error_response(self, f"Auto tuning failed: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        _json_response(self, result)
 
 
 def build_app_state(setup_path: Path, project_root: Path) -> AppState:
