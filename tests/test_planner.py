@@ -64,8 +64,8 @@ def test_build_step_run_extra_args_normalizes_underscores(tmp_path: Path) -> Non
 variation_points:
   dataset_name: [kickoff]
 process_steps:
-  A02_blurred_and_bad_lighting:
-    script: pipeline/blurred_and_bad_lighting.py
+  A02_image_base_quality:
+    script: pipeline/image_base_quality/image_base_quality.py
     extra-args:
       - name: lapl_blur_threshold
         value: 100.0
@@ -77,7 +77,7 @@ process_steps:
     )
 
     setup = load_setup(setup_file)
-    run = build_step_run(setup, "A02_blurred_and_bad_lighting", {"dataset_name": "kickoff"})
+    run = build_step_run(setup, "A02_image_base_quality", {"dataset_name": "kickoff"})
     cmd = run.command()
     assert cmd[-4:] == [
         "--lapl-blur-threshold",

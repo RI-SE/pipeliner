@@ -193,7 +193,14 @@ def _encode_overlay_url(
     return "/overlay?" + urlencode(query)
 
 
-def _build_tooltip(original_size: list[int] | None, bbox: Any, final_size: Any) -> str:
+def _build_tooltip(
+    original_size: list[int] | None,
+    bbox: Any,
+    final_size: Any,
+    *,
+    source_crop_size: list[float] | None = None,
+    source_crop_box_clipped: Any = None,
+) -> str:
     original_txt = f"{original_size[0]}x{original_size[1]}" if original_size and len(original_size) == 2 else "unknown"
     if isinstance(bbox, str):
         bbox_txt = bbox
@@ -205,7 +212,23 @@ def _build_tooltip(original_size: list[int] | None, bbox: Any, final_size: Any) 
         final_txt = final_size
     else:
         final_txt = "unknown"
-    return f"Original size: {original_txt}\nCore rivet bbox: {bbox_txt}\nFinal size: {final_txt}"
+    if source_crop_size and len(source_crop_size) == 2:
+        source_crop_txt = f"{source_crop_size[0]}x{source_crop_size[1]}"
+    else:
+        source_crop_txt = "unknown"
+    if isinstance(source_crop_box_clipped, str):
+        clipped_txt = source_crop_box_clipped
+    elif source_crop_box_clipped is not None:
+        clipped_txt = json.dumps(source_crop_box_clipped)
+    else:
+        clipped_txt = "unknown"
+    return (
+        f"Original size: {original_txt}\n"
+        f"Core rivet bbox: {bbox_txt}\n"
+        f"Source crop size: {source_crop_txt}\n"
+        f"Source crop box clipped: {clipped_txt}\n"
+        f"Final size: {final_txt}"
+    )
 
 
 def _extract_bbox(element: Any) -> tuple[float, float, float, float] | None:
@@ -251,6 +274,39 @@ def _extract_bbox(element: Any) -> tuple[float, float, float, float] | None:
 
 def _annotation_xml_paths(run_dir: Path) -> list[Path]:
     return sorted(path.resolve() for path in run_dir.glob("*.xml") if path.is_file())
+
+
+def _resolve_dataset_input_dir(
+    project_root: Path,
+    setup: ExperimentSetup,
+    dataset_name: str,
+    dataset_variant: str,
+) -> Path | None:
+    dataset_meta = _dataset_choices(setup).get(dataset_name, {})
+    raw_root = str(dataset_meta.get("root", f"input/{dataset_name}")).strip()
+    if not raw_root:
+        return None
+    root_path = Path(raw_root)
+    dataset_root = root_path.resolve() if root_path.is_absolute() else (project_root / root_path).resolve()
+    input_dir = dataset_root / dataset_variant if dataset_variant else dataset_root
+    return input_dir if input_dir.exists() else None
+
+
+def _find_original_image(input_dir: Path, image_name: str) -> Path | None:
+    candidate = (input_dir / image_name).resolve()
+    try:
+        if candidate.is_file() and (candidate == input_dir or input_dir in candidate.parents):
+            return candidate
+    except OSError:
+        return None
+
+    basename = Path(image_name).name
+    if not basename:
+        return None
+    matches = sorted(path.resolve() for path in input_dir.rglob(basename) if path.is_file())
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 @functools.lru_cache(maxsize=16)
@@ -417,12 +473,28 @@ def _metrics_by_crop(metrics_csv: Path) -> dict[str, dict[str, str]]:
         }
 
 
-def _cutout_size_map(project_root: Path, dataset_name: str, dataset_variant: str) -> dict[str, list[int] | None]:
+def _parse_number_or_none(value: Any) -> float | None:
+    try:
+        num = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def _cutout_metrics_map(
+    project_root: Path,
+    dataset_name: str,
+    dataset_variant: str,
+    cutout_step_name: str,
+) -> dict[str, dict[str, Any]]:
     cutout = _load_cutout_tab(project_root, dataset_name, dataset_variant)
     if cutout.get("status") != "ok":
         return {}
-    size_map: dict[str, list[int] | None] = {}
-    run_dirs = _scan_matching_run_dirs(project_root, "A20_cut_out", dataset_name, dataset_variant)
+    metrics_map = _metrics_by_crop(Path(str(cutout.get("metrics_csv", "")).strip()))
+    out: dict[str, dict[str, Any]] = {}
+    run_dirs = _scan_matching_run_dirs(project_root, cutout_step_name, dataset_name, dataset_variant)
     summary_path = run_dirs[0] / "a20_summary.json" if run_dirs else None
     summary = _read_json(summary_path) if summary_path is not None and summary_path.exists() else None
     if isinstance(summary, dict):
@@ -434,22 +506,40 @@ def _cutout_size_map(project_root: Path, dataset_name: str, dataset_variant: str
                     continue
                 crop_file = str(crop_row.get("crop_file", "")).strip()
                 output_size = crop_row.get("output_size")
-                if crop_file and isinstance(output_size, list) and len(output_size) == 2:
+                metric_row = metrics_map.get(crop_file, {})
+                source_crop_width = _parse_number_or_none(metric_row.get("source_crop_width"))
+                source_crop_height = _parse_number_or_none(metric_row.get("source_crop_height"))
+                target_width = _parse_number_or_none(metric_row.get("target_width"))
+                target_height = _parse_number_or_none(metric_row.get("target_height"))
+                image_size = None
+                if source_crop_width is not None and source_crop_height is not None:
+                    image_size = [source_crop_width, source_crop_height]
+                elif isinstance(output_size, list) and len(output_size) == 2:
                     try:
-                        size_map[crop_file] = [int(output_size[0]), int(output_size[1])]
+                        image_size = [int(output_size[0]), int(output_size[1])]
                     except (TypeError, ValueError):
-                        size_map[crop_file] = None
-    return size_map
+                        image_size = None
+                out[crop_file] = {
+                    "image_size": image_size,
+                    "source_crop_size": [source_crop_width, source_crop_height]
+                    if source_crop_width is not None and source_crop_height is not None
+                    else None,
+                    "source_crop_box_clipped": metric_row.get("source_crop_box_clipped") or "",
+                    "target_size": [target_width, target_height]
+                    if target_width is not None and target_height is not None
+                    else None,
+                }
+    return out
 
 
-def _infer_project_root_from_args_path(args_path: Path | None) -> Path | None:
-    if args_path is None:
+def _quality_cutout_step_name(setup: ExperimentSetup, step_name: str) -> str | None:
+    step_cfg = setup.process_steps.get(step_name, {})
+    if not isinstance(step_cfg, dict):
         return None
-    resolved = args_path.resolve()
-    for parent in resolved.parents:
-        if parent.name == "pipeline_data":
-            return parent.parent
-    return None
+    if not step_cfg.get("input_from_previous"):
+        return None
+    previous_step = str(step_cfg.get("previous_step", "")).strip()
+    return previous_step or None
 
 
 def _parse_float(value: Any) -> float:
@@ -531,22 +621,39 @@ def _quality_fail_reasons(row: dict[str, str]) -> list[str]:
     return unique
 
 
-def _load_quality_tab(csv_path: Path, step_name: str, args_path: Path | None) -> dict[str, Any]:
+def _load_quality_tab(
+    csv_path: Path,
+    step_name: str,
+    args_path: Path | None,
+    *,
+    project_root: Path,
+    setup: ExperimentSetup,
+) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     columns: list[str] = []
     fail_count = 0
     pass_count = 0
     error_count = 0
     thresholds = _quality_thresholds_from_args(args_path) if args_path is not None else {}
-    cutout_sizes: dict[str, list[int] | None] = {}
+    cutout_metrics: dict[str, dict[str, Any]] = {}
     payload = _read_json(args_path) if args_path is not None and args_path.exists() else None
     variation_points = payload.get("variation_points", {}) if isinstance(payload, dict) else {}
     dataset_name = str(variation_points.get("dataset_name", "")).strip()
     dataset_variant = str(variation_points.get("dataset_variant", "")).strip()
     if dataset_name and dataset_variant:
-        project_root = _infer_project_root_from_args_path(args_path)
-        if project_root is not None:
-            cutout_sizes = _cutout_size_map(project_root, dataset_name, dataset_variant)
+        cutout_step_name = _quality_cutout_step_name(setup, step_name)
+        if cutout_step_name:
+            cutout_metrics = _cutout_metrics_map(project_root, dataset_name, dataset_variant, cutout_step_name)
+    csv_path_display = str(csv_path.resolve())
+    if payload and isinstance(payload, dict):
+        resolved = payload.get("resolved", {})
+        output_root = resolved.get("output") if isinstance(resolved, dict) else None
+        if isinstance(output_root, str) and output_root.strip():
+            try:
+                output_dir = Path(output_root).resolve()
+                csv_path_display = str(csv_path.resolve().relative_to(output_dir))
+            except ValueError:
+                csv_path_display = str(csv_path.resolve())
     try:
         with csv_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -556,7 +663,8 @@ def _load_quality_tab(csv_path: Path, step_name: str, args_path: Path | None) ->
                 if not image_path:
                     continue
                 crop_name = Path(image_path).name
-                image_size = cutout_sizes.get(crop_name)
+                crop_metrics = cutout_metrics.get(crop_name, {})
+                image_size = crop_metrics.get("image_size")
                 status = str(raw_row.get("final_status", "")).strip().upper() or "UNKNOWN"
                 if status == "FAIL":
                     fail_count += 1
@@ -586,11 +694,21 @@ def _load_quality_tab(csv_path: Path, step_name: str, args_path: Path | None) ->
                         "path": image_path,
                         "image_url": _encode_img_url(image_path),
                         "full_url": _encode_img_url(image_path),
-                        "title": f"{Path(image_path).name}\nStatus: {status}\nPath: {image_path}",
+                        "title": (
+                            f"{Path(image_path).name}\n"
+                            f"Status: {status}\n"
+                            f"Path: {image_path}\n"
+                            f"Source crop size: {crop_metrics.get('source_crop_size') or 'unknown'}\n"
+                            f"Source crop box clipped: {crop_metrics.get('source_crop_box_clipped') or 'unknown'}\n"
+                            f"Target size: {crop_metrics.get('target_size') or 'unknown'}"
+                        ),
                         "status": status,
                         "status_class": status.lower(),
                         "summary": metrics_summary,
                         "image_size": image_size,
+                        "source_crop_size": crop_metrics.get("source_crop_size"),
+                        "source_crop_box_clipped": crop_metrics.get("source_crop_box_clipped") or "",
+                        "target_size": crop_metrics.get("target_size"),
                         "fail_reasons": fail_reasons,
                         "error": str(raw_row.get("error", "")).strip(),
                         "metrics": {
@@ -635,6 +753,7 @@ def _load_quality_tab(csv_path: Path, step_name: str, args_path: Path | None) ->
         "tab_type": "quality_metrics",
         "status": "ok",
         "csv_path": str(csv_path.resolve()),
+        "csv_path_display": csv_path_display,
         "message": "",
         "rows": rows,
         "row_count": len(rows),
@@ -646,7 +765,13 @@ def _load_quality_tab(csv_path: Path, step_name: str, args_path: Path | None) ->
     }
 
 
-def _load_original_segments_tab(project_root: Path, dataset_name: str, dataset_variant: str) -> dict[str, Any]:
+def _load_original_segments_tab(
+    project_root: Path,
+    dataset_name: str,
+    dataset_variant: str,
+    *,
+    setup: ExperimentSetup,
+) -> dict[str, Any]:
     cutout = _load_cutout_tab(project_root, dataset_name, dataset_variant)
     a05_run_dirs = _scan_matching_run_dirs(project_root, "A05_segment_rivets", dataset_name, dataset_variant)
     if not a05_run_dirs:
@@ -672,52 +797,85 @@ def _load_original_segments_tab(project_root: Path, dataset_name: str, dataset_v
 
     xml_key = tuple(str(path) for path in annotation_xmls)
     annotation_index = _load_annotation_index(xml_key)
-    if cutout.get("status") != "ok":
-        return {
-            "tab_type": "original_segments",
-            "status": "error",
-            "message": "Original segment view depends on A20_cut_out summary data.",
-            "images": [],
-            "annotation_xmls": [str(path) for path in annotation_xmls],
-            "run_dir": str(a05_run_dirs[0]),
-        }
-
     images: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
     total_segments = 0
-    for cutout_item in cutout.get("cutouts", []):
-        if not isinstance(cutout_item, dict):
-            continue
-        original_path = str(cutout_item.get("original_path", "")).strip()
-        if not original_path or original_path in seen_paths:
-            continue
-        seen_paths.add(original_path)
-        image_name = Path(original_path).name
-        annotation_entry = annotation_index.get(image_name, {})
-        segments = annotation_entry.get("segments", [])
-        if not isinstance(segments, list):
-            segments = []
-        if not segments:
-            continue
-        total_segments += len(segments)
-        images.append(
-            {
-                "name": image_name,
-                "image_url": _encode_overlay_url(original_path, image_name, [str(path) for path in annotation_xmls], max_dim=420),
-                "full_url": _encode_overlay_url(original_path, image_name, [str(path) for path in annotation_xmls]),
-                "title": f"{image_name}\nSegments: {len(segments)}\nOriginal: {original_path}",
-                "path": original_path,
-                "segment_count": len(segments),
-                "summary": f"{len(segments)} segments",
+    source_mode = "a20_cut_out"
+    message = ""
+
+    if cutout.get("status") == "ok":
+        seen_paths: set[str] = set()
+        for cutout_item in cutout.get("cutouts", []):
+            if not isinstance(cutout_item, dict):
+                continue
+            original_path = str(cutout_item.get("original_path", "")).strip()
+            if not original_path or original_path in seen_paths:
+                continue
+            seen_paths.add(original_path)
+            image_name = Path(original_path).name
+            annotation_entry = annotation_index.get(image_name, {})
+            segments = annotation_entry.get("segments", [])
+            if not isinstance(segments, list) or not segments:
+                continue
+            total_segments += len(segments)
+            images.append(
+                {
+                    "name": image_name,
+                    "image_url": _encode_overlay_url(
+                        original_path, image_name, [str(path) for path in annotation_xmls], max_dim=420
+                    ),
+                    "full_url": _encode_overlay_url(original_path, image_name, [str(path) for path in annotation_xmls]),
+                    "title": f"{image_name}\nSegments: {len(segments)}\nOriginal: {original_path}",
+                    "path": original_path,
+                    "segment_count": len(segments),
+                    "summary": f"{len(segments)} segments",
+                }
+            )
+    else:
+        source_mode = "dataset_input"
+        input_dir = _resolve_dataset_input_dir(project_root, setup, dataset_name, dataset_variant)
+        if input_dir is None:
+            return {
+                "tab_type": "original_segments",
+                "status": "missing",
+                "message": (
+                    f"A20_cut_out is not available yet, and the dataset input folder for "
+                    f"{dataset_name}/{dataset_variant} could not be resolved from setup."
+                ),
+                "images": [],
+                "annotation_xmls": [str(path) for path in annotation_xmls],
+                "run_dir": str(a05_run_dirs[0]),
             }
-        )
+
+        message = "A20_cut_out is not available yet. Showing original images directly from dataset input."
+        for image_name, annotation_entry in sorted(annotation_index.items()):
+            segments = annotation_entry.get("segments", [])
+            if not isinstance(segments, list) or not segments:
+                continue
+            original_path = _find_original_image(input_dir, image_name)
+            if original_path is None:
+                continue
+            total_segments += len(segments)
+            images.append(
+                {
+                    "name": Path(image_name).name,
+                    "image_url": _encode_overlay_url(
+                        str(original_path), image_name, [str(path) for path in annotation_xmls], max_dim=420
+                    ),
+                    "full_url": _encode_overlay_url(str(original_path), image_name, [str(path) for path in annotation_xmls]),
+                    "title": f"{Path(image_name).name}\nSegments: {len(segments)}\nOriginal: {original_path}",
+                    "path": str(original_path),
+                    "segment_count": len(segments),
+                    "summary": f"{len(segments)} segments",
+                }
+            )
 
     return {
         "tab_type": "original_segments",
         "status": "ok",
-        "message": "",
+        "message": message,
         "run_dir": str(a05_run_dirs[0]),
         "annotation_xmls": [str(path) for path in annotation_xmls],
+        "source_mode": source_mode,
         "total_images": len(images),
         "total_segments": total_segments,
         "images": images,
@@ -797,7 +955,18 @@ def _load_cutout_tab(project_root: Path, dataset_name: str, dataset_variant: str
             metric_row = metrics_map.get(crop_file, {})
             bbox = metric_row.get("rivet_core_bbox") or crop_row.get("bbox_xyxy") or []
             final_size = metric_row.get("target_size") or crop_row.get("output_size") or []
-            tooltip = _build_tooltip(original_size, bbox, final_size)
+            source_crop_size = None
+            source_crop_width = _parse_number_or_none(metric_row.get("source_crop_width"))
+            source_crop_height = _parse_number_or_none(metric_row.get("source_crop_height"))
+            if source_crop_width is not None and source_crop_height is not None:
+                source_crop_size = [source_crop_width, source_crop_height]
+            tooltip = _build_tooltip(
+                original_size,
+                bbox,
+                final_size,
+                source_crop_size=source_crop_size,
+                source_crop_box_clipped=metric_row.get("source_crop_box_clipped"),
+            )
             cutouts.append(
                 {
                     "name": crop_file,
@@ -827,7 +996,13 @@ def _load_cutout_tab(project_root: Path, dataset_name: str, dataset_variant: str
     }
 
 
-def _discover_quality_tabs(project_root: Path, dataset_name: str, dataset_variant: str) -> list[dict[str, Any]]:
+def _discover_quality_tabs(
+    project_root: Path,
+    dataset_name: str,
+    dataset_variant: str,
+    *,
+    setup: ExperimentSetup,
+) -> list[dict[str, Any]]:
     pipeline_data = project_root / "pipeline_data"
     if not pipeline_data.exists():
         return []
@@ -850,14 +1025,28 @@ def _discover_quality_tabs(project_root: Path, dataset_name: str, dataset_varian
             parts = csv_path.parts
             if len(parts) < 4 or parts[-3] != dataset_name or parts[-2] != dataset_variant:
                 continue
-        tabs.append(_load_quality_tab(csv_path, step_name, args_path if args_path.exists() else None))
+        tabs.append(
+            _load_quality_tab(
+                csv_path,
+                step_name,
+                args_path if args_path.exists() else None,
+                project_root=project_root,
+                setup=setup,
+            )
+        )
     return tabs
 
 
-def _build_selection_payload(project_root: Path, dataset_name: str, dataset_variant: str) -> dict[str, Any]:
-    original_segments = _load_original_segments_tab(project_root, dataset_name, dataset_variant)
+def _build_selection_payload(
+    project_root: Path,
+    dataset_name: str,
+    dataset_variant: str,
+    *,
+    setup: ExperimentSetup,
+) -> dict[str, Any]:
+    original_segments = _load_original_segments_tab(project_root, dataset_name, dataset_variant, setup=setup)
     cutout = _load_cutout_tab(project_root, dataset_name, dataset_variant)
-    quality_tabs = _discover_quality_tabs(project_root, dataset_name, dataset_variant)
+    quality_tabs = _discover_quality_tabs(project_root, dataset_name, dataset_variant, setup=setup)
     return {
         "dataset_name": dataset_name,
         "dataset_variant": dataset_variant,
@@ -975,6 +1164,42 @@ HTML = """<!doctype html>
     }
     .stat .k { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
     .stat .v { display: block; margin-top: 5px; font-size: 20px; font-weight: 700; }
+    .meta-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+    .meta-row .k {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      white-space: nowrap;
+    }
+    .meta-row .v {
+      font-size: 13px;
+      color: var(--text);
+      word-break: break-all;
+    }
+    .meta-inline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 18px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .meta-chip {
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
     .section-title {
       margin: 20px 0 12px;
       font-size: 18px;
@@ -1175,6 +1400,11 @@ HTML = """<!doctype html>
       font-size: 14px;
       background: #fff;
       color: var(--text);
+    }
+    .threshold-input:disabled {
+      background: #f1f5f8;
+      color: #8a98a5;
+      cursor: not-allowed;
     }
     .simulate-row {
       display: flex;
@@ -1411,6 +1641,22 @@ HTML = """<!doctype html>
       return pct ? `${(num * 100).toFixed(digits)}%` : num.toFixed(digits);
     }
 
+    function formatSize(value) {
+      if (!Array.isArray(value) || value.length !== 2) return "unknown";
+      const [w, h] = value;
+      if (w === null || w === undefined || h === null || h === undefined) return "unknown";
+      const width = Number(w);
+      const height = Number(h);
+      if (!Number.isFinite(width) || !Number.isFinite(height)) return "unknown";
+      return `${width} x ${height} px`;
+    }
+
+    function formatValue(value) {
+      if (value === null || value === undefined || value === "") return "unknown";
+      if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    }
+
     function createQualityCard(item) {
       const card = document.createElement("div");
       card.className = "thumb-card";
@@ -1423,7 +1669,9 @@ HTML = """<!doctype html>
         return passFlag ? "metric-ok" : "metric-bad";
       };
       const meanClass = (checks.darkness_pass === false || checks.brightness_pass === false) ? "metric-bad" : "metric-ok";
-      const size = Array.isArray(item.image_size) && item.image_size.length === 2 ? `${item.image_size[0]} x ${item.image_size[1]} px` : "unknown";
+      const targetSize = formatSize(item.target_size);
+      const sourceCropSize = formatSize(item.source_crop_size || item.image_size);
+      const sourceCropBoxClipped = formatValue(item.source_crop_box_clipped);
       card.innerHTML = `
         <div class="thumb-img-wrap">
           <img class="thumb-img" loading="lazy" src="${item.image_url}" alt="${item.name}" />
@@ -1443,7 +1691,9 @@ HTML = """<!doctype html>
             <div class="${metricClass(checks.white_clip_pass)}"><strong>White</strong> ${formatMetric(item.metrics.white_clip, 2, true)}</div>
           </div>
           ${reasons ? `<div class="reason-list">${reasons}</div>` : ""}
-          <div class="size-line"><strong>Size</strong> ${size}</div>
+          <div class="size-line"><strong>Source crop size</strong> ${sourceCropSize}</div>
+          <div class="size-line"><strong>Target size</strong> ${targetSize}</div>
+          <div class="size-line"><strong>Source crop box clipped</strong> ${sourceCropBoxClipped}</div>
         </div>
       `;
       const image = card.querySelector(".thumb-img");
@@ -1480,6 +1730,31 @@ HTML = """<!doctype html>
         };
       }
       return QUALITY_MEASURE_OVERRIDES[tab.id];
+    }
+
+    function setThresholdInputState(currentTab) {
+      const enabledChecks = currentQualityMeasures(currentTab);
+      const mapping = [
+        ["chk_lap", "thr_lap", "laplacian_pass"],
+        ["chk_brisque", "thr_brisque", "brisque_pass"],
+        ["chk_niqe", "thr_niqe", "niqe_pass"],
+        ["chk_dark", "thr_dark", "darkness_pass"],
+        ["chk_bright", "thr_bright", "brightness_pass"],
+        ["chk_contrast", "thr_contrast", "contrast_pass"],
+        ["chk_black", "thr_black", "black_clip_pass"],
+        ["chk_white", "thr_white", "white_clip_pass"],
+      ];
+      mapping.forEach(([checkId, inputId, key]) => {
+        const check = el(checkId);
+        const input = el(inputId);
+        const enabled = enabledChecks[key] !== false;
+        if (check) {
+          check.checked = enabled;
+        }
+        if (input) {
+          input.disabled = !enabled;
+        }
+      });
     }
 
     function parseThresholdValue(rawValue, fallbackValue) {
@@ -1537,9 +1812,12 @@ HTML = """<!doctype html>
         return `<div class="empty">${tab && tab.message ? tab.message : "No original segment data found."}</div>`;
       }
 
+      const sourceLabel = tab.source_mode === "dataset_input" ? "Dataset Input" : "A20 Summary";
       const stats = `
+        ${tab.message ? `<div class="empty" style="margin-bottom:14px;">${tab.message}</div>` : ""}
         <div class="meta">
           <div class="stat"><span class="k">A05 Run Dir</span><span class="v path">${tab.run_dir}</span></div>
+          <div class="stat"><span class="k">Image Source</span><span class="v">${sourceLabel}</span></div>
           <div class="stat"><span class="k">Images With Segments</span><span class="v">${tab.total_images}</span></div>
           <div class="stat"><span class="k">Segments Found</span><span class="v">${tab.total_segments}</span></div>
         </div>
@@ -1601,11 +1879,16 @@ HTML = """<!doctype html>
         thresholds.white_clip_threshold !== undefined ? `white <= ${formatMetric(thresholds.white_clip_threshold, 2, true)}` : "",
       ].filter(Boolean).join(" | ");
       return `
-        <div class="meta">
-          <div class="stat"><span class="k">CSV</span><span class="v path">${tab.csv_path}</span></div>
-          <div class="stat"><span class="k">Rows</span><span class="v">${rows.length}</span></div>
-          <div class="stat"><span class="k">PASS</span><span class="v">${passCount}</span></div>
-          <div class="stat"><span class="k">FAIL</span><span class="v">${failCount}</span></div>
+        <div class="meta-row">
+          <span class="k">CSV</span>
+          <span class="v path">${tab.csv_path_display || tab.csv_path}</span>
+        </div>
+        <div class="meta-inline">
+          <span class="meta-chip">Rows ${rows.length}</span>
+          <span class="meta-chip">PASS ${passCount}</span>
+          <span class="meta-chip">FAIL ${failCount}</span>
+          <span class="meta-chip">Source ${Array.from(new Set(rows.map(row => formatSize(row.source_crop_size || row.image_size)).filter(value => value !== "unknown"))).join(", ") || "unknown"}</span>
+          <span class="meta-chip">Target ${Array.from(new Set(rows.map(row => formatSize(row.target_size)).filter(value => value !== "unknown"))).join(", ") || "unknown"}</span>
         </div>
         <div class="threshold-section-title">Blur Thresholds</div>
         <div class="threshold-grid">
@@ -1697,6 +1980,32 @@ HTML = """<!doctype html>
           button.addEventListener("click", () => {
             QUALITY_FILTER = button.getAttribute("data-quality-filter") || "all";
             renderContent();
+          });
+        });
+        setThresholdInputState(currentTab);
+        [
+          "chk_lap",
+          "chk_brisque",
+          "chk_niqe",
+          "chk_dark",
+          "chk_bright",
+          "chk_contrast",
+          "chk_black",
+          "chk_white",
+        ].forEach(checkId => {
+          const checkbox = el(checkId);
+          if (!checkbox) return;
+          checkbox.addEventListener("change", () => {
+            const enabledChecks = currentQualityMeasures(currentTab);
+            enabledChecks.laplacian_pass = !!el("chk_lap")?.checked;
+            enabledChecks.brisque_pass = !!el("chk_brisque")?.checked;
+            enabledChecks.niqe_pass = !!el("chk_niqe")?.checked;
+            enabledChecks.darkness_pass = !!el("chk_dark")?.checked;
+            enabledChecks.brightness_pass = !!el("chk_bright")?.checked;
+            enabledChecks.contrast_pass = !!el("chk_contrast")?.checked;
+            enabledChecks.black_clip_pass = !!el("chk_black")?.checked;
+            enabledChecks.white_clip_pass = !!el("chk_white")?.checked;
+            setThresholdInputState(currentTab);
           });
         });
         const simulateBtn = el("simulate_btn");
@@ -1867,7 +2176,12 @@ class IQViewerHandler(BaseHTTPRequestHandler):
                 return
             _json_response(
                 self,
-                _build_selection_payload(self.app_state.project_root, dataset_name, dataset_variant),
+                _build_selection_payload(
+                    self.app_state.project_root,
+                    dataset_name,
+                    dataset_variant,
+                    setup=self.app_state.setup,
+                ),
             )
             return
         if parsed.path == "/img":
