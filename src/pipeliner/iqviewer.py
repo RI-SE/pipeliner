@@ -276,6 +276,55 @@ def _annotation_xml_paths(run_dir: Path) -> list[Path]:
     return sorted(path.resolve() for path in run_dir.glob("*.xml") if path.is_file())
 
 
+def _parse_target_size_value(raw: Any) -> tuple[int, int] | None:
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    try:
+        if "x" in text:
+            w_raw, h_raw = text.split("x", 1)
+            width = int(w_raw)
+            height = int(h_raw)
+        else:
+            width = int(text)
+            height = width
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _step_extra_args_map(step_cfg: dict[str, Any]) -> dict[str, Any]:
+    raw = step_cfg.get("extra-args", step_cfg.get("extra_args", []))
+    out: dict[str, Any] = {}
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("name", "")).strip()
+        if not key:
+            continue
+        out[key] = item.get("value")
+    return out
+
+
+def _a20_simulation_defaults(setup: ExperimentSetup) -> dict[str, Any]:
+    step_cfg = setup.process_steps.get("A20_cut_out", {})
+    if not isinstance(step_cfg, dict):
+        return {}
+    extras = _step_extra_args_map(step_cfg)
+    target_size = _parse_target_size_value(extras.get("target-size", extras.get("target_size", "")))
+    return {
+        "target_width": target_size[0] if target_size else 256,
+        "target_height": target_size[1] if target_size else 256,
+        "k_aoi_scale_factor": _parse_number_or_none(extras.get("k-aoi-scale-factor", extras.get("k_aoi_scale_factor"))),
+        "aoi_fill_percentage": _parse_number_or_none(extras.get("aoi-fill-percentage", extras.get("aoi_fill_percentage"))),
+        "label": str(step_cfg.get("label", "rivet")).strip() or "rivet",
+    }
+
+
 def _resolve_dataset_input_dir(
     project_root: Path,
     setup: ExperimentSetup,
@@ -438,12 +487,104 @@ def _draw_segments_on_image(base_image: Any, segments: list[dict[str, Any]]) -> 
     return Image.alpha_composite(canvas, overlay)
 
 
+def _compute_simulated_crop_box(
+    bbox: list[float],
+    *,
+    target_width: int,
+    target_height: int,
+    k_aoi_scale_factor: float,
+    aoi_fill_percentage: float,
+) -> tuple[float, float, float, float] | None:
+    if len(bbox) != 4:
+        return None
+    if target_width <= 0 or target_height <= 0:
+        return None
+    if not math.isfinite(k_aoi_scale_factor) or not math.isfinite(aoi_fill_percentage):
+        return None
+    if k_aoi_scale_factor <= 0 or aoi_fill_percentage <= 0:
+        return None
+    rivet_fill = aoi_fill_percentage / k_aoi_scale_factor
+    if rivet_fill <= 0 or rivet_fill >= 1:
+        return None
+    x0, y0, x1, y1 = bbox
+    bw = max(1.0, float(x1 - x0))
+    bh = max(1.0, float(y1 - y0))
+    object_diameter = max(bw, bh)
+    side = object_diameter / rivet_fill
+    target_ar = float(target_width) / float(target_height)
+    src_w = side
+    src_h = side
+    if target_ar >= 1.0:
+        src_w = side * target_ar
+    else:
+        src_h = side / target_ar
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    return (
+        cx - src_w / 2.0,
+        cy - src_h / 2.0,
+        cx + src_w / 2.0,
+        cy + src_h / 2.0,
+    )
+
+
+def _draw_simulated_crop_boxes(
+    overlay: Any,
+    *,
+    segments: list[dict[str, Any]],
+    image_size: tuple[int, int],
+    target_width: int,
+    target_height: int,
+    k_aoi_scale_factor: float,
+    aoi_fill_percentage: float,
+    label: str,
+) -> Any:
+    if ImageDraw is None:
+        return overlay
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    wanted_label = label.strip().casefold()
+    image_width, image_height = image_size
+    for segment in segments:
+        segment_label = str(segment.get("label", "")).strip().casefold()
+        if wanted_label and segment_label != wanted_label:
+            continue
+        bbox = segment.get("bbox", [])
+        if not isinstance(bbox, list):
+            continue
+        crop_box = _compute_simulated_crop_box(
+            [float(v) for v in bbox],
+            target_width=target_width,
+            target_height=target_height,
+            k_aoi_scale_factor=k_aoi_scale_factor,
+            aoi_fill_percentage=aoi_fill_percentage,
+        )
+        if crop_box is None:
+            continue
+        x0, y0, x1, y1 = crop_box
+        clipped = (
+            max(0.0, min(float(image_width), x0)),
+            max(0.0, min(float(image_height), y0)),
+            max(0.0, min(float(image_width), x1)),
+            max(0.0, min(float(image_height), y1)),
+        )
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            continue
+        draw.rectangle(clipped, outline=(255, 214, 10, 255), width=4)
+    return overlay
+
+
 def _render_overlay_bytes(
     image_path: Path,
     image_name: str,
     annotation_xmls: list[Path],
     *,
     max_dim: int | None = None,
+    simulate_crop: bool = False,
+    target_width: int = 256,
+    target_height: int = 256,
+    k_aoi_scale_factor: float = math.nan,
+    aoi_fill_percentage: float = math.nan,
+    label: str = "rivet",
 ) -> tuple[bytes, str]:
     if Image is None:
         ctype, _ = mimetypes.guess_type(image_path.name)
@@ -453,6 +594,17 @@ def _render_overlay_bytes(
     segments = annotation_index.get(image_name, {}).get("segments", [])
     with Image.open(image_path) as img:
         rendered = _draw_segments_on_image(img, segments)
+        if simulate_crop:
+            rendered = _draw_simulated_crop_boxes(
+                rendered,
+                segments=segments,
+                image_size=img.size,
+                target_width=target_width,
+                target_height=target_height,
+                k_aoi_scale_factor=k_aoi_scale_factor,
+                aoi_fill_percentage=aoi_fill_percentage,
+                label=label,
+            )
         if max_dim is not None and max_dim > 0:
             rendered.thumbnail((max_dim, max_dim))
         from io import BytesIO
@@ -586,6 +738,14 @@ def _quality_thresholds_from_args(args_path: Path) -> dict[str, float]:
             continue
         thresholds[key] = value
     return thresholds
+
+
+def _parse_positive_int_or_default(raw: Any, default: int) -> int:
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def _quality_fail_reasons(row: dict[str, str]) -> list[str]:
@@ -820,6 +980,7 @@ def _load_original_segments_tab(
             images.append(
                 {
                     "name": image_name,
+                    "image_name": image_name,
                     "image_url": _encode_overlay_url(
                         original_path, image_name, [str(path) for path in annotation_xmls], max_dim=420
                     ),
@@ -858,6 +1019,7 @@ def _load_original_segments_tab(
             images.append(
                 {
                     "name": Path(image_name).name,
+                    "image_name": image_name,
                     "image_url": _encode_overlay_url(
                         str(original_path), image_name, [str(path) for path in annotation_xmls], max_dim=420
                     ),
@@ -875,6 +1037,7 @@ def _load_original_segments_tab(
         "message": message,
         "run_dir": str(a05_run_dirs[0]),
         "annotation_xmls": [str(path) for path in annotation_xmls],
+        "simulation_defaults": _a20_simulation_defaults(setup),
         "source_mode": source_mode,
         "total_images": len(images),
         "total_segments": total_segments,
@@ -1406,6 +1569,30 @@ HTML = """<!doctype html>
       color: #8a98a5;
       cursor: not-allowed;
     }
+    .simulate-controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .simulate-card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+    }
+    .simulate-card label {
+      margin-bottom: 6px;
+    }
+    .simulate-input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 14px;
+      background: #fff;
+      color: var(--text);
+    }
     .simulate-row {
       display: flex;
       gap: 10px;
@@ -1552,6 +1739,7 @@ HTML = """<!doctype html>
     let QUALITY_FILTER = "all";
     let QUALITY_THRESHOLD_OVERRIDES = {};
     let QUALITY_MEASURE_OVERRIDES = {};
+    let ORIGINAL_SEGMENT_SIM_OVERRIDES = {};
     let zoomState = { scale: 1, x: 0, y: 0, dragging: false, startX: 0, startY: 0 };
 
     function el(id) {
@@ -1631,6 +1819,47 @@ HTML = """<!doctype html>
       }
       card.addEventListener("click", () => openModal(item.full_url, item.name));
       return card;
+    }
+
+    function currentOriginalSegmentParams(tab) {
+      const defaults = (tab && tab.simulation_defaults) ? tab.simulation_defaults : {};
+      return {
+        target_width: Number(ORIGINAL_SEGMENT_SIM_OVERRIDES.target_width ?? defaults.target_width ?? 256),
+        target_height: Number(ORIGINAL_SEGMENT_SIM_OVERRIDES.target_height ?? defaults.target_height ?? 256),
+        k_aoi_scale_factor: Number(
+          ORIGINAL_SEGMENT_SIM_OVERRIDES.k_aoi_scale_factor ?? defaults.k_aoi_scale_factor ?? 1.8
+        ),
+        aoi_fill_percentage: Number(
+          ORIGINAL_SEGMENT_SIM_OVERRIDES.aoi_fill_percentage ?? defaults.aoi_fill_percentage ?? 0.95
+        ),
+        label: String(ORIGINAL_SEGMENT_SIM_OVERRIDES.label ?? defaults.label ?? "rivet"),
+      };
+    }
+
+    function buildOriginalOverlayUrl(item, tab, maxDim) {
+      const params = new URLSearchParams();
+      params.set("path", item.path);
+      params.set("image_name", item.image_name || item.name);
+      (tab.annotation_xmls || []).forEach(xmlPath => params.append("xml", xmlPath));
+      if (maxDim) params.set("max_dim", String(maxDim));
+      const sim = currentOriginalSegmentParams(tab);
+      params.set("simulate_crop", "true");
+      params.set("target_width", String(sim.target_width));
+      params.set("target_height", String(sim.target_height));
+      params.set("k_aoi_scale_factor", String(sim.k_aoi_scale_factor));
+      params.set("aoi_fill_percentage", String(sim.aoi_fill_percentage));
+      params.set("label", sim.label);
+      return "/overlay?" + params.toString();
+    }
+
+    function createOriginalSegmentCard(item, tab) {
+      const previewUrl = buildOriginalOverlayUrl(item, tab, 420);
+      const fullUrl = buildOriginalOverlayUrl(item, tab, 0);
+      return createThumbCard({
+        ...item,
+        image_url: previewUrl,
+        full_url: fullUrl,
+      });
     }
 
     function formatMetric(value, digits = 2, pct = false) {
@@ -1813,6 +2042,7 @@ HTML = """<!doctype html>
       }
 
       const sourceLabel = tab.source_mode === "dataset_input" ? "Dataset Input" : "A20 Summary";
+      const sim = currentOriginalSegmentParams(tab);
       const stats = `
         ${tab.message ? `<div class="empty" style="margin-bottom:14px;">${tab.message}</div>` : ""}
         <div class="meta">
@@ -1825,8 +2055,34 @@ HTML = """<!doctype html>
 
       return `
         ${stats}
+        <div class="section-title">A20 Cut Simulation</div>
+        <div class="simulate-controls">
+          <div class="simulate-card">
+            <label for="sim_target_width">Target Width</label>
+            <input id="sim_target_width" class="simulate-input" type="number" min="1" step="1" value="${sim.target_width}" />
+          </div>
+          <div class="simulate-card">
+            <label for="sim_target_height">Target Height</label>
+            <input id="sim_target_height" class="simulate-input" type="number" min="1" step="1" value="${sim.target_height}" />
+          </div>
+          <div class="simulate-card">
+            <label for="sim_k_aoi_scale_factor">k-AOI Scale Factor</label>
+            <input id="sim_k_aoi_scale_factor" class="simulate-input" type="number" min="0.0001" step="any" value="${sim.k_aoi_scale_factor}" />
+          </div>
+          <div class="simulate-card">
+            <label for="sim_aoi_fill_percentage">AOI Fill Percentage</label>
+            <input id="sim_aoi_fill_percentage" class="simulate-input" type="number" min="0.0001" step="any" value="${sim.aoi_fill_percentage}" />
+          </div>
+          <div class="simulate-card">
+            <label for="sim_label">Label</label>
+            <input id="sim_label" class="simulate-input" type="text" value="${sim.label}" />
+          </div>
+        </div>
+        <div class="simulate-row">
+          <button type="button" id="simulate_original_btn" class="simulate-btn">Simulate</button>
+        </div>
         <div>
-          <div class="section-title">Original Images With Segmentation Overlay</div>
+          <div class="section-title">Original Images With Segmentation Overlay And Simulated Cut Box</div>
           <div id="original_segments_grid" class="thumb-grid"></div>
         </div>
       `;
@@ -1929,9 +2185,22 @@ HTML = """<!doctype html>
         host.innerHTML = renderOriginalSegmentsTab(VIEW.original_segments);
         const grid = el("original_segments_grid");
         const images = (VIEW.original_segments && VIEW.original_segments.images) ? VIEW.original_segments.images : [];
+        const simulateBtn = el("simulate_original_btn");
+        if (simulateBtn) {
+          simulateBtn.addEventListener("click", () => {
+            ORIGINAL_SEGMENT_SIM_OVERRIDES = {
+              target_width: Number(el("sim_target_width")?.value || 256),
+              target_height: Number(el("sim_target_height")?.value || 256),
+              k_aoi_scale_factor: Number(el("sim_k_aoi_scale_factor")?.value || 1.8),
+              aoi_fill_percentage: Number(el("sim_aoi_fill_percentage")?.value || 0.95),
+              label: String(el("sim_label")?.value || "rivet"),
+            };
+            renderContent();
+          });
+        }
         if (grid) {
           if (images.length) {
-            images.forEach(item => grid.appendChild(createThumbCard(item)));
+            images.forEach(item => grid.appendChild(createOriginalSegmentCard(item, VIEW.original_segments)));
           } else {
             grid.innerHTML = '<div class="empty">No segmented source images found.</div>';
           }
@@ -2064,6 +2333,7 @@ HTML = """<!doctype html>
         ACTIVE_TAB = "original_segments";
       }
       QUALITY_FILTER = "all";
+      ORIGINAL_SEGMENT_SIM_OVERRIDES = {};
       renderTabs();
       renderContent();
     }
@@ -2209,6 +2479,12 @@ class IQViewerHandler(BaseHTTPRequestHandler):
             raw_path = str(query.get("path", [""])[0]).strip()
             image_name = str(query.get("image_name", [""])[0]).strip()
             xml_paths = [Path(unquote(value)).expanduser() for value in query.get("xml", []) if str(value).strip()]
+            simulate_crop = str(query.get("simulate_crop", ["false"])[0]).strip().lower() in {"1", "true", "yes", "on"}
+            target_width = _parse_positive_int_or_default(query.get("target_width", ["256"])[0], 256)
+            target_height = _parse_positive_int_or_default(query.get("target_height", ["256"])[0], 256)
+            k_aoi_scale_factor = _parse_number_or_none(query.get("k_aoi_scale_factor", [""])[0])
+            aoi_fill_percentage = _parse_number_or_none(query.get("aoi_fill_percentage", [""])[0])
+            label = str(query.get("label", ["rivet"])[0]).strip() or "rivet"
             try:
                 max_dim = int(str(query.get("max_dim", ["0"])[0]).strip() or "0")
             except ValueError:
@@ -2239,6 +2515,12 @@ class IQViewerHandler(BaseHTTPRequestHandler):
                     image_name,
                     resolved_xmls,
                     max_dim=max_dim if max_dim > 0 else None,
+                    simulate_crop=simulate_crop,
+                    target_width=target_width,
+                    target_height=target_height,
+                    k_aoi_scale_factor=k_aoi_scale_factor if k_aoi_scale_factor is not None else math.nan,
+                    aoi_fill_percentage=aoi_fill_percentage if aoi_fill_percentage is not None else math.nan,
+                    label=label,
                 )
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not render overlay: {exc}")
