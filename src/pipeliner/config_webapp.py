@@ -156,6 +156,12 @@ HTML_TEMPLATE = """<!doctype html>
     .status-success { background:#1f9d57; }
     .status-failed { background:#d64545; }
     .status-running { background:#2b77d1; }
+    .config-alert { margin: 0 0 12px; padding: 14px 16px; border: 2px solid #b42318; border-radius: 12px; background: #fef3f2; color: #7a271a; display:none; }
+    .config-alert.show { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .config-alert-text { font-size: 14px; font-weight: 700; }
+    .config-alert-sub { margin-top:4px; font-size:12px; font-weight:400; color:#912018; }
+    .btn-reload-config { border:1px solid #1f7a3d; background:#1f9d57; color:#fff; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:700; white-space:nowrap; }
+    .btn-reload-config[disabled] { opacity:0.7; cursor:wait; }
     .group-row { background:#f8fbff; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     .kv { display:grid; grid-template-columns: 120px 1fr; gap:6px 10px; font-size:13px; }
@@ -180,6 +186,13 @@ HTML_TEMPLATE = """<!doctype html>
       <button class="tab" id="tab_viewer" data-tab="viewer">Viewer</button>
       <button class="tab" id="tab_runner" data-tab="runner">Runner</button>
       <button class="tab" id="tab_analysis" data-tab="analysis">Analysis</button>
+    </div>
+    <div id="config_alert" class="config-alert">
+      <div>
+        <div id="config_alert_text" class="config-alert-text">Config changed on disk.</div>
+        <div id="config_alert_sub" class="config-alert-sub"></div>
+      </div>
+      <button class="btn-reload-config" id="reload_config_btn" type="button">Reload Config</button>
     </div>
     <div class="card">
       <div class="grid" id="variation_grid"></div>
@@ -255,6 +268,8 @@ let VAR_QUERY_KEYS = [];
 let VAR_DISPLAY_NAMES = {};
 let VAR_ENUMERATE_FLAGS = {};
 let ACTIVE_TAB = "__DEFAULT_TAB__";
+let CONFIG_STATUS = null;
+let CONFIG_STATUS_TIMER = null;
 const ALL_TOKEN = "ALL";
 
 const QUERY_KEY_BY_VARIATION = {
@@ -444,6 +459,80 @@ async function fetchJson(url, options = null) {
   return { r, j };
 }
 
+function formatTimestamp(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toLocaleString();
+}
+
+function updateConfigBanner(status) {
+  CONFIG_STATUS = status || null;
+  const banner = document.getElementById("config_alert");
+  const text = document.getElementById("config_alert_text");
+  const sub = document.getElementById("config_alert_sub");
+  if (!banner || !text || !sub) return;
+  if (!status || !status.changed) {
+    banner.classList.remove("show");
+    text.textContent = "Config changed on disk.";
+    sub.textContent = "";
+    return;
+  }
+  const setupPath = stripRootFromText(status.setup_path || "");
+  const diskMtime = formatTimestamp(status.disk_mtime || "");
+  const loadedMtime = formatTimestamp(status.loaded_mtime || "");
+  text.textContent = "Configuration file changed on disk. The running server is using an older copy.";
+  sub.textContent = `Loaded: ${loadedMtime || "unknown"} | On disk: ${diskMtime || "unknown"} | ${setupPath}`;
+  banner.classList.add("show");
+}
+
+async function refreshConfigStatus() {
+  try {
+    const { r, j } = await fetchJson("/api/config-status?_ts=" + Date.now());
+    if (!r.ok) return;
+    updateConfigBanner(j);
+  } catch (_) {
+    // ignore transient polling issues
+  }
+}
+
+async function reloadConfigFromDisk() {
+  const btn = document.getElementById("reload_config_btn");
+  const runlog = document.getElementById("runlog");
+  const guiState = snapshotGuiState();
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Reloading...";
+  }
+  try {
+    const { r, j } = await fetchJson("/api/reload-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!r.ok) {
+      if (runlog) runlog.textContent = `HTTP ${r.status}\n\n${formatRunLog(j)}`;
+      return;
+    }
+    await loadOptions();
+    restoreGuiState(guiState);
+    updateConfigBanner(j.config_status || null);
+    CACHE_BUST = Date.now().toString();
+    await refreshAll();
+    if (runlog) {
+      const setupPath = stripRootFromText((j.config_status || {}).setup_path || "");
+      runlog.textContent = `Reloaded config from disk: ${setupPath}`;
+    }
+  } catch (err) {
+    if (runlog) runlog.textContent = `Reload failed: ${err}`;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Reload Config";
+    }
+  }
+}
+
 function fillSelect(el, values, enumerateOptions = false, defaultIndex = 0) {
   const prev = el.value;
   el.innerHTML = "";
@@ -550,6 +639,7 @@ async function refreshPipeline() {
 }
 
 async function refreshAll() {
+  await refreshConfigStatus();
   await refreshSelected();
   await refreshPipeline();
   await refreshTree();
@@ -650,6 +740,11 @@ async function refreshRunnerPlan() {
 
 async function runApi(path) {
   const runlog = document.getElementById("runlog");
+  await refreshConfigStatus();
+  if (CONFIG_STATUS && CONFIG_STATUS.changed) {
+    runlog.textContent = "Configuration changed on disk. Reload the config before starting a run.";
+    return;
+  }
   if (path.includes("run-pipeline") && ACTIVE_TAB !== "runner") {
     runlog.textContent = "Run Pipeline(s) is only enabled in Runner tab.";
     return;
@@ -816,7 +911,7 @@ async function refreshTree() {
   document.getElementById("output_treeview").textContent = stripRootFromText(j.output_tree || "");
 }
 
-async function init() {
+async function loadOptions() {
   const { j } = await fetchJson("/api/options?_ts=" + Date.now());
   OPTIONS = j;
   VAR_DISPLAY_NAMES = OPTIONS.variation_display_names || {};
@@ -827,6 +922,48 @@ async function init() {
     OPTIONS.step_display_names || {},
     OPTIONS.step_enumerate || {},
   );
+}
+
+function snapshotGuiState() {
+  const variationValues = {};
+  VAR_QUERY_KEYS.forEach((key) => {
+    const el = document.getElementById(`vp_${key}`);
+    if (el) variationValues[key] = el.value;
+  });
+  return {
+    activeTab: ACTIVE_TAB,
+    step: document.getElementById("step").value,
+    experimentName: document.getElementById("experiment_name").value,
+    variationValues,
+  };
+}
+
+function restoreGuiState(state) {
+  if (!state) return;
+
+  const stepEl = document.getElementById("step");
+  if (stepEl && Array.from(stepEl.options).some((opt) => opt.value === state.step)) {
+    stepEl.value = state.step;
+  }
+
+  const experimentEl = document.getElementById("experiment_name");
+  if (experimentEl) experimentEl.value = state.experimentName || "";
+
+  setTab(state.activeTab || ACTIVE_TAB);
+  renderVariationPoints();
+
+  Object.entries(state.variationValues || {}).forEach(([key, value]) => {
+    const el = document.getElementById(`vp_${key}`);
+    if (!el || !Array.from(el.options).some((opt) => opt.value === value)) return;
+    el.value = value;
+    if (!key.endsWith("_variant")) {
+      el.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
+async function init() {
+  await loadOptions();
   ["viewer", "runner", "analysis"].forEach(t => {
     const b = document.getElementById(`tab_${t}`);
     if (b) b.addEventListener("click", async () => {
@@ -860,6 +997,9 @@ async function init() {
   document.getElementById("run_pipeline").addEventListener("click", () => runApi("/api/run-pipeline"));
   document.getElementById("cancel_job").addEventListener("click", cancelCurrentJob);
   document.getElementById("purge_output_btn").addEventListener("click", purgeOutputTree);
+  document.getElementById("reload_config_btn").addEventListener("click", reloadConfigFromDisk);
+  CONFIG_STATUS_TIMER = window.setInterval(refreshConfigStatus, 3000);
+  await refreshConfigStatus();
 }
 init();
 </script>
@@ -884,6 +1024,8 @@ def make_handler(
     *,
     html: str,
 ):
+    setup_path = layout.setup_path.resolve()
+    loaded_setup_mtime_ns = setup_path.stat().st_mtime_ns if setup_path.exists() else None
     log_dir = layout.root_dir / "pipeline" / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -891,6 +1033,27 @@ def make_handler(
     jobs_lock = threading.Lock()
     next_job_id = 1
     root_cmd_prefix = f"cd {shlex.quote(str(layout.root_dir))} && "
+
+    def iso_for_mtime_ns(mtime_ns: int | None) -> str:
+        if mtime_ns is None:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime_ns / 1_000_000_000))
+
+    def current_config_status() -> dict[str, object]:
+        disk_mtime_ns = setup_path.stat().st_mtime_ns if setup_path.exists() else None
+        changed = disk_mtime_ns != loaded_setup_mtime_ns
+        return {
+            "setup_path": str(setup_path),
+            "loaded_mtime": iso_for_mtime_ns(loaded_setup_mtime_ns),
+            "disk_mtime": iso_for_mtime_ns(disk_mtime_ns),
+            "changed": changed,
+        }
+
+    def reload_layout_from_disk() -> dict[str, object]:
+        nonlocal layout, loaded_setup_mtime_ns
+        layout = PipelineLayout(layout.root_dir)
+        loaded_setup_mtime_ns = setup_path.stat().st_mtime_ns if setup_path.exists() else None
+        return current_config_status()
 
     def now_iso() -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1601,6 +1764,10 @@ def make_handler(
                 as_json(self, payload)
                 return
 
+            if parsed.path == "/api/config-status":
+                as_json(self, current_config_status())
+                return
+
             if parsed.path == "/api/resolve":
                 try:
                     query = parse_qs(parsed.query)
@@ -1818,11 +1985,15 @@ def make_handler(
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path not in {"/api/run-step", "/api/run-pipeline", "/api/run-cancel", "/api/delete-output"}:
+            if parsed.path not in {"/api/run-step", "/api/run-pipeline", "/api/run-cancel", "/api/delete-output", "/api/reload-config"}:
                 as_json(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
                 return
             try:
                 payload = parse_payload(self)
+                if parsed.path == "/api/reload-config":
+                    status = reload_layout_from_disk()
+                    as_json(self, {"status": "reloaded", "config_status": status})
+                    return
                 if parsed.path == "/api/delete-output":
                     q = {k: [str(v)] for k, v in payload.items()}
                     ctx = make_ctx(q, default_experiment_name, layout)

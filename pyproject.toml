@@ -23,7 +23,8 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 dependencies = [
-  "PyYAML>=6.0"
+  "PyYAML>=6.0",
+  "Pillow>=10.0"
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,7 @@ dev = [
 pipeliner = "pipeliner.webapp:main"
 pipeliner-cli = "pipeliner.cli:main"
 pipeliner-web = "pipeliner.webapp:main"
+pipeliner-iqviewer = "pipeliner.iqviewer:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

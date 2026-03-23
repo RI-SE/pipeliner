@@ -4,6 +4,8 @@
 
 It resolves variation points, expands step templates, and builds a runnable contract per step.
 
+The package also includes `iqviewer`, a lightweight image-quality viewer for pipeline outputs.
+
 ## Core idea
 
 You define:
@@ -92,6 +94,49 @@ pipeliner --port 8080 --config /path/to/opticap-qai/pipeline/experiment_setup.ya
 pipeliner-cli list --setup examples/experiment_setup.yaml
 pipeliner-cli show --setup examples/experiment_setup.yaml --step A40_repair --set dataset_name=kickoff --set dataset_variant=circled --set algo_name=patchcore
 ```
+
+If you prefer a Conda-first launcher for local use, there is also:
+
+```bash
+cd pipeliner
+python start.sh
+```
+
+That helper script:
+- prompts for `experiment_setup.yaml` if you do not pass `--config`
+- checks whether the Conda env exists
+- offers to create it if missing
+- installs/updates `pipeliner` into that env
+- launches the selected app with the selected config
+
+Example:
+
+```bash
+cd pipeliner
+python start.sh --env-name pipeliner --config ../pipeline/experiment_setup.yaml
+python start.sh --app iqviewer --config ../pipeline/experiment_setup.yaml
+```
+
+There are also two executable wrappers next to `start.sh`:
+
+```bash
+cd pipeliner
+./pipeliner --config ../pipeline/experiment_setup.yaml
+./iqviewer --config ../pipeline/experiment_setup.yaml
+```
+
+## Environment model
+
+`pipeliner` itself and the pipeline steps it launches do not have to use the same environment strategy.
+
+- The `pipeliner` web UI/package in this repo is typically run from a normal Python virtual environment such as `.venv`.
+- Consumer pipeline steps may still declare Conda runtimes in their `experiment_setup.yaml`, for example `runtime.conda_env: anomalib` or `runtime.conda_env: masker-app`.
+- When a step declares `runtime.conda_env`, the runner launches it with `conda run -n <env> ...`.
+- If a step does not declare `runtime.conda_env`, it runs with the Python interpreter that launched `pipeliner`.
+
+This means the UI can start successfully from `.venv` while individual steps still fail later if the required Conda envs are missing or renamed in the consumer repo.
+
+At the moment, this package does not ship a `pipeliner/environment.yml`. The canonical dependency source for the package itself is [pyproject.toml](./pyproject.toml). If you want a Conda-managed `pipeliner` env, create one separately and install the package there with `pip install -e '.[dev]'`.
 
 Run from any working directory:
 - pass absolute/relative `--config`

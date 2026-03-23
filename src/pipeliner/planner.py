@@ -25,7 +25,10 @@ def build_extra_args(step_cfg: dict[str, Any]) -> list[str]:
         name = str(name_raw).strip()
         if not name:
             raise ValueError(f"process_step.extra-args[{idx}] name must be non-empty")
-        flag = name if name.startswith("-") else f"--{name}"
+        if name.startswith("-"):
+            flag = name
+        else:
+            flag = f"--{name.replace('_', '-')}"
 
         if "value" not in item:
             out.append(flag)
@@ -44,6 +47,38 @@ def build_extra_args(step_cfg: dict[str, Any]) -> list[str]:
             continue
         out.extend([flag, str(value)])
     return out
+
+
+def _resolve_dataset_root(setup: ExperimentSetup, selection: dict[str, Any]) -> str:
+    if "dataset_root" in selection and str(selection.get("dataset_root", "")).strip():
+        return str(selection.get("dataset_root", "")).strip()
+
+    dataset_name_raw = selection.get("dataset_name")
+    if dataset_name_raw is None:
+        return ""
+    dataset_name = str(dataset_name_raw).strip()
+    if not dataset_name:
+        return ""
+
+    ds_cfg = (
+        setup.variation_points.get("dataset_name")
+        if isinstance(setup.variation_points, dict)
+        else None
+    )
+    if isinstance(ds_cfg, dict):
+        options = ds_cfg.get("options", [])
+        if isinstance(options, list):
+            for item in options:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name", "")).strip() != dataset_name:
+                    continue
+                root_raw = item.get("root")
+                root = str(root_raw).strip() if root_raw is not None else ""
+                if root:
+                    return root
+
+    return f"input/{dataset_name}"
 
 
 @dataclass
@@ -68,7 +103,12 @@ def build_step_run(
         raise KeyError(f"Unknown step: {step_name}")
 
     step_cfg = setup.process_steps[step_name]
-    context = dict(variation_selection)
+    effective_selection = dict(variation_selection)
+    dataset_root = _resolve_dataset_root(setup, effective_selection)
+    if dataset_root:
+        effective_selection.setdefault("dataset_root", dataset_root)
+
+    context = dict(effective_selection)
     context["process_step"] = step_name
 
     expanded = render_value(step_cfg, context)
@@ -88,7 +128,7 @@ def build_step_run(
         )
 
     contract = StepContract(
-        variation_points=variation_selection,
+        variation_points=effective_selection,
         process_step={"name": step_name, **expanded},
         resolved=resolved,
         runtime=runtime,
