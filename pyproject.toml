@@ -23,9 +23,11 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 dependencies = [
+  "fastapi>=0.115",
   "PyYAML>=6.0",
   "Pillow>=10.0",
-  "pandas>=2.2"
+  "pandas>=2.2",
+  "uvicorn>=0.30"
 ]
 
 [project.optional-dependencies]
@@ -41,6 +43,7 @@ pipeliner = "pipeliner.webapp:main"
 pipeliner-cli = "pipeliner.cli:main"
 pipeliner-web = "pipeliner.webapp:main"
 pipeliner-iqviewer = "pipeliner.iqviewer:main"
+pipeliner-dataset-builder = "pipeliner.dataset_builder:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

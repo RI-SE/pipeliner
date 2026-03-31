@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--app",
-        choices=["pipeliner", "iqviewer"],
+        choices=["pipeliner", "iqviewer", "dataset_builder"],
         default=None,
         help="Which app to launch. Defaults to `pipeliner`, or infers from wrapper script name.",
     )
@@ -46,6 +46,8 @@ def infer_app_name(cli_app: str | None) -> str:
     if cli_app:
         return cli_app
     stem = Path(sys.argv[0]).name
+    if "dataset_builder" in stem:
+        return "dataset_builder"
     if "iqviewer" in stem:
         return "iqviewer"
     return "pipeliner"
@@ -54,6 +56,8 @@ def infer_app_name(cli_app: str | None) -> str:
 def default_port_for_app(app_name: str) -> int:
     if app_name == "iqviewer":
         return 8780
+    if app_name == "dataset_builder":
+        return 8008
     return 8080
 
 
@@ -147,7 +151,12 @@ def install_pipeliner(env_name: str, package_dir: Path) -> None:
 
 
 def launch_app(app_name: str, env_name: str, setup_path: Path, host: str, port: int) -> int:
-    executable = "pipeliner-iqviewer" if app_name == "iqviewer" else "pipeliner"
+    if app_name == "iqviewer":
+        executable = "pipeliner-iqviewer"
+    elif app_name == "dataset_builder":
+        executable = "pipeliner-dataset-builder"
+    else:
+        executable = "pipeliner"
     cmd = [
         "conda",
         "run",

@@ -1439,6 +1439,7 @@ def make_handler(
                 "conda_env": conda_env,
                 "runner_python": runner_python,
                 "lama_python_bin": lama_python_bin,
+                "setup_path": str(setup_path),
             },
         }
         contract_json = json.dumps(contract, separators=(",", ":"))

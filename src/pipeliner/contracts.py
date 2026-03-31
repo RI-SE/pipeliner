@@ -13,6 +13,7 @@ class RuntimeInfo:
     log_err: str = ""
     conda_env: str = ""
     runner_python: str = "python3"
+    setup_path: str = ""
 
 
 @dataclass

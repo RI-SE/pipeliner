@@ -12,8 +12,10 @@ def build_extra_args(step_cfg: dict[str, Any]) -> list[str]:
     raw = step_cfg.get("extra-args", step_cfg.get("extra_args", []))
     if raw is None:
         return []
+    if isinstance(raw, dict):
+        return []
     if not isinstance(raw, list):
-        raise ValueError("process_step.extra-args must be a list")
+        raise ValueError("process_step.extra-args must be a list or object")
 
     out: list[str] = []
     for idx, item in enumerate(raw):
