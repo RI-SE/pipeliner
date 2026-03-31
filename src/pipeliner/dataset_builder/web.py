@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import html
+import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from .core import DatasetItem, export_dataset, preview_split
-from ..planner import build_step_run
-from ..setup_loader import load_setup
+from .core import DatasetItem, export_dataset, initialize_split_assignments, preview_split
 
 
 @dataclass
@@ -123,6 +123,21 @@ def _render_page(state: WebState) -> str:
         )
 
     counts = preview.get("counts", {})
+    split_config = state.session.get("split", {})
+    split_labels = [str(v) for v in split_config.get("split_labels", [])]
+    ratio_map = split_config.get("split_ratios", {}) if isinstance(split_config, dict) else {}
+    ratio_inputs: list[str] = []
+    for split_name in split_labels:
+        if split_name == "discard":
+            continue
+        ratio_value = ratio_map.get(split_name, "")
+        ratio_inputs.append(
+            "<label class='split-param'>"
+            f"<span>{html.escape(split_name)}</span>"
+            f"<input type='number' step='any' data-ratio-name='{html.escape(split_name)}' value='{html.escape(str(ratio_value))}' />"
+            "</label>"
+        )
+    split_seed_value = split_config.get("split_seed", 0) if isinstance(split_config, dict) else 0
     stat_tiles: list[str] = []
     total_images = len(state.items)
     assigned_images = sum(sum(class_map.values()) for class_map in counts.values())
@@ -154,11 +169,16 @@ def _render_page(state: WebState) -> str:
     .toolbar button {{ border: none; background: #0d4f8b; color: #fff; padding: 10px 16px; border-radius: 10px; font-weight: 600; cursor: pointer; }}
     .config-alert {{ display: none; margin: 12px 0 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid #f0b429; background: #fff7df; color: #7a4f01; }}
     .config-alert.show {{ display: block; }}
-    .config-alert-row {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
     .config-alert-text {{ font-weight: 600; }}
-    .btn-reload-config {{ border: 1px solid #1f7a3d; background: #1f9d57; color: #fff; padding: 8px 12px; border-radius: 8px; cursor: pointer; font-weight: 700; }}
-    .btn-reload-config[disabled] {{ opacity: 0.7; cursor: wait; }}
     .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 16px 0 18px; }}
+    .split-box {{ margin: 10px 0 12px; padding: 12px; border: 1px solid #dbe2ea; border-radius: 12px; background: #fff; }}
+    .split-title {{ font-weight: 700; margin-bottom: 10px; color: #1c334d; }}
+    .split-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }}
+    .split-param {{ display: grid; gap: 4px; font-size: 12px; color: #48617d; text-transform: uppercase; letter-spacing: .04em; }}
+    .split-param input {{ border: 1px solid #c4d0dd; border-radius: 8px; padding: 8px; background: #fff; font-size: 14px; text-transform: none; letter-spacing: normal; color: #1a2433; }}
+    .split-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }}
+    .split-actions button {{ border: none; background: #245f9e; color: #fff; padding: 8px 12px; border-radius: 8px; cursor: pointer; font-weight: 700; }}
+    .split-status {{ font-size: 13px; color: #4c6178; }}
     .stat {{ background: #fff; border: 1px solid #dbe2ea; border-radius: 12px; padding: 10px 12px; display: grid; gap: 4px; }}
     .stat span {{ font-size: 12px; color: #48617d; text-transform: uppercase; letter-spacing: .04em; }}
     .stat strong {{ font-size: 24px; line-height: 1; }}
@@ -207,7 +227,7 @@ def _render_page(state: WebState) -> str:
       }}
       const disk = status.disk_mtime || 'unknown';
       const loaded = status.loaded_mtime || 'unknown';
-      text.textContent = 'Configuration file changed on disk. Running view uses older copy. loaded=' + loaded + ', disk=' + disk;
+      text.textContent = 'Configuration changed on disk. Restart B10 to reload config. loaded=' + loaded + ', disk=' + disk;
       banner.classList.add('show');
     }}
 
@@ -218,30 +238,50 @@ def _render_page(state: WebState) -> str:
       renderConfigStatus(CONFIG_STATUS);
     }}
 
-    async function reloadConfigFromDisk() {{
-      const btn = document.getElementById('reload_config_btn');
-      if (!btn) return;
-      btn.disabled = true;
-      const old = btn.textContent;
-      btn.textContent = 'Reloading...';
-      try {{
-        const {{ response, payload }} = await fetchJson('/api/reload-config', {{ method: 'POST' }});
-        if (response.ok) {{
-          CONFIG_STATUS = payload.config_status || null;
-          renderConfigStatus(CONFIG_STATUS);
-          window.location.reload();
-          return;
-        }}
-      }} finally {{
-        btn.disabled = false;
-        btn.textContent = old;
-      }}
-    }}
-
     async function assignForm(form) {{
       const params = new URLSearchParams(new FormData(form));
       await fetch('/assign-async?' + params.toString(), {{ method: 'POST' }});
     }}
+
+    async function resampleAssignments() {{
+      const seedInput = document.getElementById('split_seed');
+      const statusEl = document.getElementById('split_status');
+      const ratioInputs = Array.from(document.querySelectorAll('[data-ratio-name]'));
+      const split_ratios = {{}};
+      for (const input of ratioInputs) {{
+        const key = input.getAttribute('data-ratio-name');
+        if (!key) continue;
+        split_ratios[key] = Number(input.value);
+      }}
+      const payload = {{
+        split_seed: Number(seedInput ? seedInput.value : 0),
+        split_ratios
+      }};
+      if (statusEl) statusEl.textContent = 'Resampling...';
+      const {{ response, payload: body }} = await fetchJson('/api/resample', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload),
+      }});
+      if (!response.ok) {{
+        if (statusEl) statusEl.textContent = 'Fel: ' + (body.error || 'kunde inte resampla');
+        return;
+      }}
+      if (statusEl) statusEl.textContent = 'Uppdaterat.';
+      window.location.reload();
+    }}
+
+    async function finishAndQuit() {{
+      const confirmed = window.confirm('Avsluta dataset builder och stäng processen?');
+      if (!confirmed) return;
+      const {{ response, payload }} = await fetchJson('/shutdown', {{ method: 'POST' }});
+      if (!response.ok) {{
+        window.alert(payload.error || 'Kunde inte avsluta dataset builder.');
+        return;
+      }}
+      window.location.href = '/shutdown';
+    }}
+
     function openTab(panelId, btn) {{
       document.querySelectorAll('.tab-panel').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
@@ -251,8 +291,8 @@ def _render_page(state: WebState) -> str:
     }}
 
     window.addEventListener('load', async () => {{
-      const reloadBtn = document.getElementById('reload_config_btn');
-      if (reloadBtn) reloadBtn.addEventListener('click', reloadConfigFromDisk);
+      const resampleBtn = document.getElementById('resample_btn');
+      if (resampleBtn) resampleBtn.addEventListener('click', resampleAssignments);
       await refreshConfigStatus();
       CONFIG_STATUS_TIMER = window.setInterval(refreshConfigStatus, 3000);
     }});
@@ -264,12 +304,24 @@ def _render_page(state: WebState) -> str:
     <h1>Dataset Builder</h1>
     <div class="toolbar">
       <form class=\"inline\" method=\"post\" action=\"/generate\"><button type=\"submit\">Generate Training Structure</button></form>
+      <button type="button" onclick="finishAndQuit()">Finish / Quit</button>
     </div>
   </div>
   <div id="config_alert" class="config-alert">
-    <div class="config-alert-row">
-      <div id="config_alert_text" class="config-alert-text">Config changed on disk.</div>
-      <button class="btn-reload-config" id="reload_config_btn" type="button">Reload Config</button>
+    <div id="config_alert_text" class="config-alert-text">Config changed on disk.</div>
+  </div>
+  <div class="split-box">
+    <div class="split-title">Split Parameters</div>
+    <div class="split-grid">
+      <label class="split-param">
+        <span>split_seed</span>
+        <input type="number" step="1" id="split_seed" value="{html.escape(str(split_seed_value))}" />
+      </label>
+      {''.join(ratio_inputs)}
+    </div>
+    <div class="split-actions">
+      <button type="button" id="resample_btn">Resample</button>
+      <div class="split-status" id="split_status">Parametrar laddade från aktuell config.</div>
     </div>
   </div>
   <div class="stats">{''.join(stat_tiles)}</div>
@@ -305,6 +357,14 @@ def build_app(
     item_index = {item.item_id: item for item in state.items}
     app = FastAPI(title="Dataset Builder")
 
+    def _schedule_shutdown(delay_s: float = 0.35) -> None:
+        def _shutdown() -> None:
+            os._exit(0)
+
+        timer = threading.Timer(delay_s, _shutdown)
+        timer.daemon = True
+        timer.start()
+
     def _iso_for_mtime_ns(mtime_ns: int | None) -> str:
         if mtime_ns is None:
             return ""
@@ -330,99 +390,46 @@ def build_app(
             "watch_enabled": True,
         }
 
-    def _apply_reloaded_payload(payload: dict[str, Any], payload_items: list[DatasetItem]) -> None:
-        restored = dict(payload) if isinstance(payload, dict) else {}
-        restored.setdefault("config", {})
-        restored.setdefault("split", {})
-        restored.setdefault("labels", {})
-        restored.setdefault("split_assignments", {})
-        restored.setdefault("paths", {})
-        restored.setdefault("input_sections", {})
-        restored.setdefault("csv_loaded", False)
+    @app.post("/api/resample", response_model=None)
+    async def resample(request: Request) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "invalid payload"}, status_code=400)
 
-        if payload_items:
-            next_items = payload_items
-        else:
-            from .core import initialize_split_assignments, load_assignment_csv, scan_dataset_items
+        split = state.session.setdefault("split", {})
+        split_labels = [str(v) for v in split.get("split_labels", [])]
+        if not split_labels:
+            return JSONResponse({"error": "split_labels missing"}, status_code=400)
 
-            next_items = scan_dataset_items(
-                restored.get("input_sections", {}),
-                class_labels=restored.get("config", {}).get("class_labels", []),
-            )
-            load_assignment_csv(restored, next_items)
-            if not restored.get("split_assignments"):
-                initial = initialize_split_assignments(next_items, restored.get("split", {}))
-                restored.setdefault("split_assignments", {}).update(initial)
-            preview_split(
-                next_items,
-                restored.get("labels", {}),
-                restored.get("split", {}),
-                restored.get("split_assignments", {}),
-            )
-
-        state.session = restored
-        state.items = next_items
-        item_index.clear()
-        item_index.update({item.item_id: item for item in next_items})
-
-    def _try_rebuild_from_setup() -> tuple[dict[str, Any], list[DatasetItem]] | None:
-        if state.watch_path is None or not state.watch_path.exists():
-            return None
-        if state.watch_path.suffix.lower() not in {".yaml", ".yml"}:
-            return None
-        contract = state.session.get("contract", {})
-        if not isinstance(contract, dict):
-            return None
-        process_step = contract.get("process_step", {})
-        if not isinstance(process_step, dict):
-            return None
-        step_name = str(process_step.get("name", "")).strip()
-        if not step_name:
-            return None
-        variation_points = contract.get("variation_points", {})
-        if not isinstance(variation_points, dict):
-            return None
-        setup = load_setup(state.watch_path)
-        run = build_step_run(setup, step_name, variation_points)
-        from .core import derive_session_from_contract, initialize_split_assignments, load_assignment_csv, scan_dataset_items
-
-        rebuilt = derive_session_from_contract(run.contract.to_dict(), state.watch_path)
-        rebuilt_paths = rebuilt.setdefault("paths", {})
-        rebuilt_paths["watched_config_path"] = str(state.watch_path)
-        for key in ("contract_path", "contract", "input_sections"):
-            if key in state.session and key not in rebuilt:
-                rebuilt[key] = state.session[key]
-        next_items = scan_dataset_items(
-            rebuilt.get("input_sections", {}),
-            class_labels=rebuilt.get("config", {}).get("class_labels", []),
-        )
-        load_assignment_csv(rebuilt, next_items)
-        if not rebuilt.get("split_assignments"):
-            initial = initialize_split_assignments(next_items, rebuilt.get("split", {}))
-            rebuilt.setdefault("split_assignments", {}).update(initial)
-        preview_split(
-            next_items,
-            rebuilt.get("labels", {}),
-            rebuilt.get("split", {}),
-            rebuilt.get("split_assignments", {}),
-        )
-        return rebuilt, next_items
-
-    def _reload_config_from_disk() -> dict[str, Any]:
-        rebuilt = None
+        split_seed_raw = payload.get("split_seed", split.get("split_seed", 0))
         try:
-            rebuilt = _try_rebuild_from_setup()
-        except Exception:  # noqa: BLE001
-            rebuilt = None
-        if rebuilt is not None:
-            payload, payload_items = rebuilt
-            _apply_reloaded_payload(payload, payload_items)
-        elif state.session_path is not None and state.session_path.exists():
-            payload, payload_items = load_preloaded_session(state.session_path)
-            _apply_reloaded_payload(payload, payload_items)
-        state.loaded_session_mtime_ns = state.session_path.stat().st_mtime_ns if state.session_path and state.session_path.exists() else None
-        state.loaded_watch_mtime_ns = state.watch_path.stat().st_mtime_ns if state.watch_path and state.watch_path.exists() else None
-        return _current_config_status()
+            split_seed = int(split_seed_raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "split_seed must be int"}, status_code=400)
+
+        ratios_raw = payload.get("split_ratios", {})
+        if not isinstance(ratios_raw, dict):
+            return JSONResponse({"error": "split_ratios must be object"}, status_code=400)
+
+        updated_ratios = dict(split.get("split_ratios", {}))
+        for name in split_labels:
+            if name == "discard":
+                continue
+            value_raw = ratios_raw.get(name, updated_ratios.get(name))
+            try:
+                value = float(value_raw)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": f"split_ratio for {name} must be numeric"}, status_code=400)
+            updated_ratios[name] = value
+
+        total = sum(float(updated_ratios.get(name, 0.0)) for name in split_labels if name != "discard")
+        if not (abs(total - 1.0) < 1e-9 or abs(total - 100.0) < 1e-9):
+            return JSONResponse({"error": "split_ratios must sum to 1 or 100"}, status_code=400)
+
+        split["split_seed"] = split_seed
+        split["split_ratios"] = updated_ratios
+        state.session["split_assignments"] = initialize_split_assignments(state.items, split)
+        return JSONResponse({"ok": True})
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> HTMLResponse:
@@ -431,11 +438,6 @@ def build_app(
     @app.get("/api/config-status", response_model=None)
     def config_status() -> JSONResponse:
         return JSONResponse(_current_config_status())
-
-    @app.post("/api/reload-config", response_model=None)
-    def reload_config() -> JSONResponse:
-        status = _reload_config_from_disk()
-        return JSONResponse({"status": "reloaded", "config_status": status})
 
     @app.get("/assign")
     def assign(item_id: str, class_label: str = "", split_label: str = "") -> RedirectResponse:
@@ -485,6 +487,35 @@ def build_app(
         )
         export_dataset(state.session, state.items, preview, recreate_dataset=True)
         return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/shutdown", response_model=None)
+    def shutdown() -> JSONResponse:
+        _schedule_shutdown()
+        return JSONResponse({"ok": True})
+
+    @app.get("/shutdown", response_class=HTMLResponse)
+    def shutdown_page() -> HTMLResponse:
+        _schedule_shutdown()
+        return HTMLResponse(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Dataset Builder Closed</title>
+</head>
+<body style="font-family: Avenir Next, Segoe UI, sans-serif; padding: 24px; background: #f4f6f8; color: #1a2433;">
+  <h1 style="margin-top: 0;">Dataset Builder avslutas</h1>
+  <p>Processen stängs nu ned. Den här fliken kan stängas.</p>
+  <script>
+    window.setTimeout(() => {
+      window.close();
+    }, 150);
+  </script>
+</body>
+</html>
+"""
+        )
 
     return app
 
