@@ -11,10 +11,12 @@ import re
 import shutil
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -56,11 +58,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-tab", choices=["viewer", "runner", "analysis"], default="viewer")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open-browser", nargs="?", const="true", default=None)
+    parser.add_argument("--no-open-browser", nargs="?", const="true", default=None)
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument("--experiment-name", default="experiment1_")
     parser.add_argument("--runner-python", default="python3")
     parser.add_argument("--lama-python-bin", default="/Users/dfm01/miniconda/envs/lama-inpainting/bin/python")
     return parser.parse_args()
+
+
+def _to_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def wait_for_local_url(url: str, timeout_s: float = 15.0, interval_s: float = 0.25) -> bool:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port
+    if not host or port is None:
+        return False
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(interval_s)
+    return False
+
+
+def open_browser_url(url: str) -> tuple[bool, str]:
+    try:
+        opened = webbrowser.open(url, new=1, autoraise=True)
+        if opened:
+            return True, "webbrowser"
+    except Exception as exc:  # noqa: BLE001
+        last_error = str(exc)
+    else:
+        last_error = "webbrowser returned false"
+
+    for candidate in ("open", "xdg-open"):
+        launcher = shutil.which(candidate)
+        if launcher is None:
+            continue
+        try:
+            subprocess.Popen([launcher, url])
+            return True, candidate
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+
+    return False, last_error
 
 
 def as_json(handler: BaseHTTPRequestHandler, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -2087,7 +2144,20 @@ def main() -> None:
         html=html,
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
-    print(f"{title}: http://{args.host}:{args.port}")
+    open_browser = False if _to_bool(args.no_open_browser, default=False) else _to_bool(args.open_browser, default=True)
+    browser_host = "localhost" if args.host in {"0.0.0.0", "::", ""} else args.host
+    url = f"http://{browser_host}:{args.port}"
+    print(f"{title}: {url}")
+    if open_browser:
+        def _open_later() -> None:
+            wait_for_local_url(url, timeout_s=20.0)
+            opened, via = open_browser_url(url)
+            if opened:
+                print(f"[pipeliner] opened browser via {via}: {url}", flush=True)
+            else:
+                print(f"[pipeliner] could not open browser automatically: {via}", flush=True)
+
+        threading.Thread(target=_open_later, daemon=True).start()
     server.serve_forever()
 
 

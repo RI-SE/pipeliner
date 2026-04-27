@@ -224,7 +224,7 @@ def _build_tooltip(
         clipped_txt = "unknown"
     return (
         f"Original size: {original_txt}\n"
-        f"Core rivet bbox: {bbox_txt}\n"
+        f"Rivet bbox: {bbox_txt}\n"
         f"Source crop size: {source_crop_txt}\n"
         f"Source crop box clipped: {clipped_txt}\n"
         f"Final size: {final_txt}"
@@ -492,39 +492,36 @@ def _compute_simulated_crop_box(
     *,
     target_width: int,
     target_height: int,
-    k_aoi_scale_factor: float,
     aoi_fill_percentage: float,
 ) -> tuple[float, float, float, float] | None:
     if len(bbox) != 4:
         return None
     if target_width <= 0 or target_height <= 0:
         return None
-    if not math.isfinite(k_aoi_scale_factor) or not math.isfinite(aoi_fill_percentage):
+    if not math.isfinite(aoi_fill_percentage):
         return None
-    if k_aoi_scale_factor <= 0 or aoi_fill_percentage <= 0:
-        return None
-    rivet_fill = aoi_fill_percentage / k_aoi_scale_factor
-    if rivet_fill <= 0 or rivet_fill >= 1:
+    if aoi_fill_percentage <= 0.0 or aoi_fill_percentage >= 1.0:
         return None
     x0, y0, x1, y1 = bbox
     bw = max(1.0, float(x1 - x0))
     bh = max(1.0, float(y1 - y0))
-    object_diameter = max(bw, bh)
-    side = object_diameter / rivet_fill
+    base_side = max(bw, bh)
     target_ar = float(target_width) / float(target_height)
-    src_w = side
-    src_h = side
-    if target_ar >= 1.0:
-        src_w = side * target_ar
-    else:
-        src_h = side / target_ar
+    target_area = (base_side * base_side) / aoi_fill_percentage
+    crop_w = math.sqrt(target_area * target_ar)
+    crop_h = math.sqrt(target_area / target_ar)
+    crop_ar = crop_w / crop_h
+    if crop_ar < target_ar:
+        crop_w = crop_h * target_ar
+    elif crop_ar > target_ar:
+        crop_h = crop_w / target_ar
     cx = (x0 + x1) / 2.0
     cy = (y0 + y1) / 2.0
     return (
-        cx - src_w / 2.0,
-        cy - src_h / 2.0,
-        cx + src_w / 2.0,
-        cy + src_h / 2.0,
+        cx - crop_w / 2.0,
+        cy - crop_h / 2.0,
+        cx + crop_w / 2.0,
+        cy + crop_h / 2.0,
     )
 
 
@@ -535,7 +532,6 @@ def _draw_simulated_crop_boxes(
     image_size: tuple[int, int],
     target_width: int,
     target_height: int,
-    k_aoi_scale_factor: float,
     aoi_fill_percentage: float,
     label: str,
 ) -> Any:
@@ -555,7 +551,6 @@ def _draw_simulated_crop_boxes(
             [float(v) for v in bbox],
             target_width=target_width,
             target_height=target_height,
-            k_aoi_scale_factor=k_aoi_scale_factor,
             aoi_fill_percentage=aoi_fill_percentage,
         )
         if crop_box is None:
@@ -582,7 +577,6 @@ def _render_overlay_bytes(
     simulate_crop: bool = False,
     target_width: int = 256,
     target_height: int = 256,
-    k_aoi_scale_factor: float = math.nan,
     aoi_fill_percentage: float = math.nan,
     label: str = "rivet",
 ) -> tuple[bytes, str]:
@@ -601,7 +595,6 @@ def _render_overlay_bytes(
                 image_size=img.size,
                 target_width=target_width,
                 target_height=target_height,
-                k_aoi_scale_factor=k_aoi_scale_factor,
                 aoi_fill_percentage=aoi_fill_percentage,
                 label=label,
             )
@@ -1210,7 +1203,7 @@ def _load_cutout_tab(project_root: Path, dataset_name: str, dataset_variant: str
                 continue
             crop_path = run_dir / crop_file
             metric_row = metrics_map.get(crop_file, {})
-            bbox = metric_row.get("rivet_core_bbox") or crop_row.get("bbox_xyxy") or []
+            bbox = metric_row.get("rivet_bbox") or crop_row.get("rivet_bbox_xyxy") or []
             final_size = metric_row.get("target_size") or crop_row.get("output_size") or []
             source_crop_size = None
             source_crop_width = _parse_number_or_none(metric_row.get("source_crop_width"))
@@ -1944,7 +1937,7 @@ HTML = """<!doctype html>
         target_width: Number(ORIGINAL_SEGMENT_SIM_OVERRIDES.target_width ?? defaults.target_width ?? 256),
         target_height: Number(ORIGINAL_SEGMENT_SIM_OVERRIDES.target_height ?? defaults.target_height ?? 256),
         k_aoi_scale_factor: Number(
-          ORIGINAL_SEGMENT_SIM_OVERRIDES.k_aoi_scale_factor ?? defaults.k_aoi_scale_factor ?? 1.8
+          ORIGINAL_SEGMENT_SIM_OVERRIDES.k_aoi_scale_factor ?? defaults.k_aoi_scale_factor ?? 3.8
         ),
         aoi_fill_percentage: Number(
           ORIGINAL_SEGMENT_SIM_OVERRIDES.aoi_fill_percentage ?? defaults.aoi_fill_percentage ?? 0.95
@@ -1963,7 +1956,6 @@ HTML = """<!doctype html>
       params.set("simulate_crop", "true");
       params.set("target_width", String(sim.target_width));
       params.set("target_height", String(sim.target_height));
-      params.set("k_aoi_scale_factor", String(sim.k_aoi_scale_factor));
       params.set("aoi_fill_percentage", String(sim.aoi_fill_percentage));
       params.set("label", sim.label);
       return "/overlay?" + params.toString();
@@ -2239,12 +2231,8 @@ HTML = """<!doctype html>
             <input id="sim_target_height" class="simulate-input" type="number" min="1" step="1" value="${sim.target_height}" />
           </div>
           <div class="simulate-card">
-            <label for="sim_k_aoi_scale_factor">k-AOI Scale Factor</label>
-            <input id="sim_k_aoi_scale_factor" class="simulate-input" type="number" min="0.0001" step="any" value="${sim.k_aoi_scale_factor}" />
-          </div>
-          <div class="simulate-card">
             <label for="sim_aoi_fill_percentage">AOI Fill Percentage</label>
-            <input id="sim_aoi_fill_percentage" class="simulate-input" type="number" min="0.0001" step="any" value="${sim.aoi_fill_percentage}" />
+            <input id="sim_aoi_fill_percentage" class="simulate-input" type="number" min="0.0001" max="0.9999" step="any" value="${sim.aoi_fill_percentage}" />
           </div>
           <div class="simulate-card">
             <label for="sim_label">Label</label>
@@ -2361,7 +2349,6 @@ HTML = """<!doctype html>
             ORIGINAL_SEGMENT_SIM_OVERRIDES = {
               target_width: Number(el("sim_target_width")?.value || 256),
               target_height: Number(el("sim_target_height")?.value || 256),
-              k_aoi_scale_factor: Number(el("sim_k_aoi_scale_factor")?.value || 1.8),
               aoi_fill_percentage: Number(el("sim_aoi_fill_percentage")?.value || 0.95),
               label: String(el("sim_label")?.value || "rivet"),
             };
@@ -2681,7 +2668,6 @@ class IQViewerHandler(BaseHTTPRequestHandler):
             simulate_crop = str(query.get("simulate_crop", ["false"])[0]).strip().lower() in {"1", "true", "yes", "on"}
             target_width = _parse_positive_int_or_default(query.get("target_width", ["256"])[0], 256)
             target_height = _parse_positive_int_or_default(query.get("target_height", ["256"])[0], 256)
-            k_aoi_scale_factor = _parse_number_or_none(query.get("k_aoi_scale_factor", [""])[0])
             aoi_fill_percentage = _parse_number_or_none(query.get("aoi_fill_percentage", [""])[0])
             label = str(query.get("label", ["rivet"])[0]).strip() or "rivet"
             try:
@@ -2717,7 +2703,6 @@ class IQViewerHandler(BaseHTTPRequestHandler):
                     simulate_crop=simulate_crop,
                     target_width=target_width,
                     target_height=target_height,
-                    k_aoi_scale_factor=k_aoi_scale_factor if k_aoi_scale_factor is not None else math.nan,
                     aoi_fill_percentage=aoi_fill_percentage if aoi_fill_percentage is not None else math.nan,
                     label=label,
                 )
