@@ -160,6 +160,52 @@ def _scan_matching_run_dirs(project_root: Path, step_name: str, dataset_name: st
     return [path for _, path in matches]
 
 
+def _resolve_path_from_project_root(project_root: Path, raw: str) -> Path:
+    path = Path(raw).expanduser()
+    return path.resolve() if path.is_absolute() else (project_root / path).resolve()
+
+
+def _expand_template_vars(raw: str, values: dict[str, str]) -> str:
+    expanded = raw
+    for key, value in values.items():
+        expanded = expanded.replace("${" + key + "}", value)
+    return expanded
+
+
+def _resolve_annotation_run_dir(
+    project_root: Path,
+    dataset_name: str,
+    dataset_variant: str,
+    *,
+    setup: ExperimentSetup,
+    cutout_run_dir: Path | None,
+) -> tuple[Path | None, str]:
+    if cutout_run_dir is not None:
+        payload = _read_json(cutout_run_dir / "args.json")
+        process_step = payload.get("process_step", {}) if isinstance(payload, dict) else {}
+        step_input = process_step.get("input") if isinstance(process_step, dict) else None
+        if isinstance(step_input, dict):
+            annotations_raw = str(step_input.get("annotations", "")).strip()
+            if annotations_raw:
+                return _resolve_path_from_project_root(project_root, annotations_raw), "A20 args.json"
+
+    step_cfg = setup.process_steps.get("A20_cut_out", {})
+    step_input = step_cfg.get("input") if isinstance(step_cfg, dict) else None
+    if isinstance(step_input, dict):
+        annotations_raw = str(step_input.get("annotations", "")).strip()
+        if annotations_raw:
+            expanded = _expand_template_vars(
+                annotations_raw,
+                {
+                    "dataset_name": dataset_name,
+                    "dataset_variant": dataset_variant,
+                },
+            )
+            return _resolve_path_from_project_root(project_root, expanded), "A20 setup"
+
+    return None, ""
+
+
 def _image_size(path: Path, cache: dict[Path, list[int] | None]) -> list[int] | None:
     if path in cache:
         return cache[path]
@@ -1020,26 +1066,34 @@ def _load_original_segments_tab(
     setup: ExperimentSetup,
 ) -> dict[str, Any]:
     cutout = _load_cutout_tab(project_root, dataset_name, dataset_variant)
-    a05_run_dirs = _scan_matching_run_dirs(project_root, "A05_segment_rivets", dataset_name, dataset_variant)
-    if not a05_run_dirs:
+    cutout_run_dir_raw = str(cutout.get("run_dir", "")).strip()
+    cutout_run_dir = Path(cutout_run_dir_raw).resolve() if cutout_run_dir_raw else None
+    annotation_run_dir, annotation_source = _resolve_annotation_run_dir(
+        project_root,
+        dataset_name,
+        dataset_variant,
+        setup=setup,
+        cutout_run_dir=cutout_run_dir,
+    )
+    if annotation_run_dir is None:
         return {
             "tab_type": "original_segments",
             "status": "missing",
-            "message": f"No A05_segment_rivets output found for {dataset_name}/{dataset_variant}.",
+            "message": f"Could not resolve annotation input for A20_cut_out for {dataset_name}/{dataset_variant}.",
             "images": [],
             "annotation_xmls": [],
             "run_dir": "",
         }
 
-    annotation_xmls = _annotation_xml_paths(a05_run_dirs[0])
+    annotation_xmls = _annotation_xml_paths(annotation_run_dir)
     if not annotation_xmls:
         return {
             "tab_type": "original_segments",
             "status": "missing",
-            "message": f"No annotation XML files found in {a05_run_dirs[0]}",
+            "message": f"No annotation XML files found in {annotation_run_dir} ({annotation_source})",
             "images": [],
             "annotation_xmls": [],
-            "run_dir": str(a05_run_dirs[0]),
+            "run_dir": str(annotation_run_dir),
         }
 
     xml_key = tuple(str(path) for path in annotation_xmls)
@@ -1091,7 +1145,7 @@ def _load_original_segments_tab(
                 ),
                 "images": [],
                 "annotation_xmls": [str(path) for path in annotation_xmls],
-                "run_dir": str(a05_run_dirs[0]),
+                "run_dir": str(annotation_run_dir),
             }
 
         message = "A20_cut_out is not available yet. Showing original images directly from dataset input."
@@ -1122,7 +1176,7 @@ def _load_original_segments_tab(
         "tab_type": "original_segments",
         "status": "ok",
         "message": message,
-        "run_dir": str(a05_run_dirs[0]),
+        "run_dir": str(annotation_run_dir),
         "annotation_xmls": [str(path) for path in annotation_xmls],
         "simulation_defaults": _a20_simulation_defaults(setup),
         "source_mode": source_mode,
