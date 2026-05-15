@@ -37,7 +37,15 @@ def _selected(value: str, expected: str) -> str:
     return " selected" if value == expected else ""
 
 
-def _render_item_card(item: DatasetItem, labels: list[str], split_labels: list[str], state: WebState) -> str:
+def _render_item_card(
+    item: DatasetItem,
+    labels: list[str],
+    split_labels: list[str],
+    state: WebState,
+    is_new: bool,
+    assigned_split: str = "",
+    has_mask: bool = False,
+) -> str:
     default_label = labels[0] if labels else ""
     current_label = str(state.session.get("labels", {}).get(item.item_id, default_label))
     current_split = str(state.session.get("split_assignments", {}).get(item.item_id, ""))
@@ -52,10 +60,25 @@ def _render_item_card(item: DatasetItem, labels: list[str], split_labels: list[s
         option = f"<option value=\"{html.escape(split)}\"{_selected(current_split, split)}>{html.escape(split)}</option>"
         split_options.append(option)
 
+    badges = []
+    if is_new:
+        badges.append("<div class='badge-new'>NEW</div>")
+    if assigned_split == "discard" and current_split != "discard":
+        badges.append("<div class='badge-excluded' title='Excluded to avoid training on the same rivet used in test set'>AUTO-EXCLUDED</div>")
+    if has_mask:
+        badges.append("<div class='badge-mask' title='Ground truth mask available for this item'>MASK</div>")
+
+    new_badge = "".join(badges)
+    card_class = "card"
+    if is_new: card_class += " is-new"
+    if assigned_split == "discard": card_class += " is-discarded"
+    
+    card_flag = "1" if is_new else "0"
     return (
-        "<article class='card'>"
+        f"<article class='{card_class}' data-is-new='{card_flag}'>"
         f"<img class='thumb' src='/image/{html.escape(item.item_id)}' alt='{html.escape(item.display_name)}' loading='lazy' />"
         "<div class='card-meta'>"
+        f"{new_badge}"
         f"<div class='name'>{html.escape(item.display_name)}</div>"
         f"<div class='group'>group: {html.escape(item.group_key)}</div>"
         "</div>"
@@ -70,6 +93,7 @@ def _render_item_card(item: DatasetItem, labels: list[str], split_labels: list[s
 
 def _render_page(state: WebState) -> str:
     grouped = _group_by_section(state.items)
+    new_item_ids = set(str(item_id) for item_id in state.session.get("new_item_ids", []))
     configured_inputs = state.session.get("input_sections", {})
     configured_sections: list[str] = []
     if isinstance(configured_inputs, dict):
@@ -83,14 +107,27 @@ def _render_page(state: WebState) -> str:
         state.session.get("split", {}),
         state.session.get("split_assignments", {}),
     )
+    all_assignments = preview.get("assignments", {})
+
+    # Index items by group_key and section to find masks easily
+    items_by_group: dict[str, dict[str, DatasetItem]] = {}
+    for item in state.items:
+        items_by_group.setdefault(item.group_key, {})[item.section] = item
 
     section_names = list(configured_sections)
     for section_name in sorted(grouped):
         if section_name not in section_names:
             section_names.append(section_name)
+
+    # Filter out sections that should be hidden (auxiliary data like masks)
+    visible_sections = [
+        name for name in section_names 
+        if "mask" not in name.lower() and name.lower() != "originals"
+    ]
+
     tab_buttons: list[str] = []
     tab_panels: list[str] = []
-    for index, section_name in enumerate(section_names):
+    for index, section_name in enumerate(visible_sections):
         section_items = grouped.get(section_name, [])
         panel_id = f"section-{index}"
         active_class = " active" if index == 0 else ""
@@ -104,7 +141,15 @@ def _render_page(state: WebState) -> str:
         if isinstance(configured_inputs, dict):
             input_dir = str(configured_inputs.get(section_name, ""))
         cards = "".join(
-            _render_item_card(item, labels=labels, split_labels=split_labels, state=state)
+            _render_item_card(
+                item,
+                labels=labels,
+                split_labels=split_labels,
+                state=state,
+                is_new=item.item_id in new_item_ids,
+                assigned_split=all_assignments.get(item.item_id, ""),
+                has_mask="masks" in items_by_group.get(item.group_key, {}),
+            )
             for item in section_items
         )
         empty_html = (
@@ -139,10 +184,21 @@ def _render_page(state: WebState) -> str:
         )
     split_seed_value = split_config.get("split_seed", 0) if isinstance(split_config, dict) else 0
     stat_tiles: list[str] = []
-    total_images = len(state.items)
-    assigned_images = sum(sum(class_map.values()) for class_map in counts.values())
+    # Only count items that are NOT in auxiliary sections (like masks) as "Total" and "Assigned"
+    main_items = [
+        item for item in state.items 
+        if "mask" not in item.section.lower() and "preview" not in item.section.lower()
+    ]
+    total_images = len(main_items)
+    assigned_images = sum(
+        1 for item in main_items 
+        if all_assignments.get(item.item_id, "") and all_assignments.get(item.item_id, "") != "discard"
+    )
+    new_images = len([item_id for item_id in state.session.get("new_item_ids", []) if any(item.item_id == item_id for item in main_items)])
+    
     stat_tiles.append(f"<div class='stat'><span>Total</span><strong>{total_images}</strong></div>")
     stat_tiles.append(f"<div class='stat'><span>Assigned</span><strong>{assigned_images}</strong></div>")
+    stat_tiles.append(f"<div class='stat'><span>New</span><strong>{new_images}</strong></div>")
     for split_name, class_map in counts.items():
         split_total = sum(class_map.values())
         details = ", ".join(f"{k}:{v}" for k, v in sorted(class_map.items()))
@@ -192,12 +248,18 @@ def _render_page(state: WebState) -> str:
     .tab-panel.active {{ display: block; }}
     .cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }}
     .card {{ border: 1px solid #dbe2ea; border-radius: 12px; padding: 8px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }}
+    .card.is-new {{ border-color: #f0b429; box-shadow: 0 0 0 1px rgba(240,180,41,0.25); }}
     .thumb {{ width: 100%; aspect-ratio: 1/1; object-fit: contain; background: #f8fafc; border-radius: 8px; }}
     .card-meta {{ margin: 8px 2px; font-size: 13px; }}
+    .badge-new {{ display: inline-block; margin-bottom: 6px; padding: 2px 8px; border-radius: 999px; background: #fff1c2; color: #7a4f01; font-size: 11px; font-weight: 700; letter-spacing: .05em; }}
+    .badge-excluded {{ display: inline-block; margin-bottom: 6px; padding: 2px 8px; border-radius: 999px; background: #e2e8f0; color: #475569; font-size: 11px; font-weight: 700; letter-spacing: .05em; }}
+    .badge-mask {{ display: inline-block; margin-bottom: 6px; padding: 2px 8px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: 11px; font-weight: 700; letter-spacing: .05em; }}
+    .card.is-discarded {{ opacity: 0.6; background: #f8fafc; }}
     .name {{ font-weight: 600; word-break: break-all; }}
     .group {{ color: #48617d; }}
     .assign-form {{ display: grid; gap: 6px; }}
     .assign-form select {{ border: 1px solid #c4d0dd; border-radius: 8px; padding: 7px 8px; background: #fff; }}
+    .filter-bar {{ display: flex; align-items: center; gap: 8px; margin: 8px 0 12px; color: #48617d; font-size: 14px; }}
     .empty {{ margin-top: 16px; color: #900; font-weight: 600; }}
     .empty-section {{ margin: 6px 0 12px; padding: 12px; border: 1px dashed #c4cfdb; border-radius: 10px; background: #f8fafc; color: #43586f; }}
     .empty-section .path {{ margin-top: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #62748a; word-break: break-all; }}
@@ -290,9 +352,21 @@ def _render_page(state: WebState) -> str:
       if (btn) btn.classList.add('active');
     }}
 
+    function toggleNewOnly() {{
+      const checkbox = document.getElementById('show_new_only');
+      const onlyNew = checkbox ? checkbox.checked : false;
+      document.querySelectorAll('.card').forEach(el => {{
+        const isNew = el.getAttribute('data-is-new') === '1';
+        el.style.display = !onlyNew || isNew ? '' : 'none';
+      }});
+    }}
+
     window.addEventListener('load', async () => {{
       const resampleBtn = document.getElementById('resample_btn');
       if (resampleBtn) resampleBtn.addEventListener('click', resampleAssignments);
+      const showNewOnly = document.getElementById('show_new_only');
+      if (showNewOnly) showNewOnly.addEventListener('change', toggleNewOnly);
+      toggleNewOnly();
       await refreshConfigStatus();
       CONFIG_STATUS_TIMER = window.setInterval(refreshConfigStatus, 3000);
     }});
@@ -325,6 +399,9 @@ def _render_page(state: WebState) -> str:
     </div>
   </div>
   <div class="stats">{''.join(stat_tiles)}</div>
+  <div class="filter-bar">
+    <label><input type="checkbox" id="show_new_only" /> Show new only</label>
+  </div>
   <h2>Inputs</h2>
   {"<div class='empty'>No images found for configured input sections.</div>" if total_images == 0 else ""}
   <div class='tab-bar'>{''.join(tab_buttons)}</div>

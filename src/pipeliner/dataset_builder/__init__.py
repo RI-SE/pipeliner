@@ -39,7 +39,7 @@ def _load_contract(raw_contract: str) -> dict[str, Any]:
 def create_app() -> Any:
     from .core import (
         initialize_split_assignments,
-        load_assignment_csv,
+        merge_assignment_inventory,
         preview_split,
         scan_dataset_items,
     )
@@ -60,7 +60,7 @@ def create_app() -> Any:
                     restored.get("input_sections", {}),
                     class_labels=restored.get("config", {}).get("class_labels", []),
                 )
-                load_assignment_csv(restored, items)
+                merge_assignment_inventory(restored, items)
                 if not restored.get("split_assignments"):
                     initial = initialize_split_assignments(items, restored.get("split", {}))
                     restored.setdefault("split_assignments", {}).update(initial)

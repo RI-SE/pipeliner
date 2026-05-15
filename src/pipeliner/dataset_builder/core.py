@@ -13,6 +13,7 @@ import yaml
 
 from pipeliner.common.contract_helpers import (
     ContractError,
+    expand_templates,
     require_extra_args,
     require_mapping,
 )
@@ -34,6 +35,10 @@ class DatasetItem:
 
 def assignment_csv_path(output_dir: str | Path) -> Path:
     return Path(output_dir).resolve() / ASSIGNMENTS_FILE
+
+
+def _csv_flag(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _require_list_of_strings(extra_args: dict[str, Any], key: str) -> list[str]:
@@ -99,8 +104,15 @@ def derive_session_from_contract(contract: dict[str, Any], contract_path: Path |
     if "images" not in output_tree or not isinstance(output_tree.get("images"), str):
         raise ContractError("output_tree_structure.images must be a string")
 
+    # Prepare variables for template expansion
+    variables = dict(contract.get("variation_points", {}))
+    variables.update(process_step)
+    if "name" in process_step:
+        variables["process_step"] = process_step["name"]
+    variables.update(contract.get("resolved", {}))
+
     output_dir_raw = process_step.get("output", contract.get("resolved", {}).get("output", ""))
-    output_dir = str(output_dir_raw).strip()
+    output_dir = str(expand_templates(output_dir_raw, variables)).strip()
     if not output_dir:
         raise ContractError("process_step.output is required")
 
@@ -141,6 +153,8 @@ def derive_session_from_contract(contract: dict[str, Any], contract_path: Path |
         },
         "labels": {},
         "split_assignments": {},
+        "inventory_item_ids": [],
+        "new_item_ids": [],
         "csv_loaded": False,
     }
 
@@ -148,12 +162,24 @@ def derive_session_from_contract(contract: dict[str, Any], contract_path: Path |
 def _iter_images(root: Path) -> list[Path]:
     if not root.exists() or not root.is_dir():
         return []
-    return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and "overlay" not in path.stem.lower()
+    )
 
 
 def _build_item_id(section: str, image_path: Path) -> str:
     digest = hashlib.sha1(f"{section}:{image_path}".encode("utf-8"), usedforsecurity=False).hexdigest()
     return digest[:16]
+
+
+def _normalize_group_key(stem: str) -> str:
+    if stem.endswith("_mask"):
+        return stem[:-5]
+    return stem
 
 
 def scan_dataset_items(
@@ -178,7 +204,7 @@ def scan_dataset_items(
                 section=section_name,
                 image_path=str(image_path.resolve()),
                 display_name=rel_name,
-                group_key=Path(rel_name).stem,
+                group_key=_normalize_group_key(Path(rel_name).stem),
             )
             items.append(item)
 
@@ -202,13 +228,31 @@ def initialize_split_assignments(items: list[DatasetItem], split: dict[str, Any]
     if not export_splits:
         return {}
 
+    # If an item belongs to a section that should be discarded by default (e.g. original images)
+    # or is auxiliary data (like masks), we assign it to 'discard' immediately.
+    assignments: dict[str, str] = {}
+    remaining_items: list[DatasetItem] = []
+    for item in items:
+        section_lower = item.section.lower()
+        # Originals and Cut-outs go to discard by default
+        if "cut_out" in section_lower or "original" in section_lower:
+            assignments[item.item_id] = "discard"
+        # Masks and auxiliary files should ALWAYS be discard (they are exported separately)
+        elif "mask" in section_lower or "preview" in section_lower:
+            assignments[item.item_id] = "discard"
+        else:
+            remaining_items.append(item)
+
+    if not remaining_items:
+        return assignments
+
     ratios = _normalize_ratios(split)
     for name in export_splits:
         if name not in ratios:
             raise ContractError(f"split_ratios missing {name}")
 
     seed = int(split.get("split_seed", 0))
-    ordered = sorted(items, key=lambda item: item.item_id)
+    ordered = sorted(remaining_items, key=lambda item: item.item_id)
     rng = random.Random(seed)
     rng.shuffle(ordered)
 
@@ -220,7 +264,6 @@ def initialize_split_assignments(items: list[DatasetItem], split: dict[str, Any]
     for index in range(remainder):
         counts[rank[index % len(rank)]] += 1
 
-    assignments: dict[str, str] = {}
     cursor = 0
     for split_name in export_splits:
         target = counts[split_name]
@@ -241,6 +284,8 @@ def load_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> bo
 
     labels = session.setdefault("labels", {})
     splits = session.setdefault("split_assignments", {})
+    new_item_ids: set[str] = set(session.setdefault("new_item_ids", []))
+    inventory_item_ids: set[str] = set()
 
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -256,15 +301,40 @@ def load_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> bo
             if item is None:
                 continue
 
+            inventory_item_ids.add(item.item_id)
             class_label = str(row.get("class_label", "")).strip()
             split_label = str(row.get("split_label", "")).strip()
             if class_label:
                 labels[item.item_id] = class_label
             if split_label:
                 splits[item.item_id] = split_label
+            if _csv_flag(row.get("is_new", "")):
+                new_item_ids.add(item.item_id)
 
+    session["inventory_item_ids"] = sorted(inventory_item_ids)
+    session["new_item_ids"] = sorted(new_item_ids)
     session["csv_loaded"] = True
     return True
+
+
+def merge_assignment_inventory(session: dict[str, Any], items: list[DatasetItem]) -> dict[str, Any]:
+    csv_found = load_assignment_csv(session, items)
+    explicit_splits = session.setdefault("split_assignments", {})
+    known_item_ids = set(str(item_id) for item_id in session.get("inventory_item_ids", []))
+
+    new_items = [item for item in items if item.item_id not in known_item_ids]
+    if new_items:
+        auto_assignments = initialize_split_assignments(new_items, session.get("split", {}))
+        explicit_splits.update(auto_assignments)
+
+    current_new_item_ids = set(session.get("new_item_ids", []))
+    current_new_item_ids.update(item.item_id for item in new_items)
+    session["new_item_ids"] = sorted(current_new_item_ids)
+    session["csv_loaded"] = csv_found
+    return {
+        "csv_found": csv_found,
+        "new_item_ids": list(session["new_item_ids"]),
+    }
 
 
 def save_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> Path:
@@ -272,6 +342,7 @@ def save_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> Pa
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     labels = session.get("labels", {})
     splits = session.get("split_assignments", {})
+    new_item_ids = set(str(item_id) for item_id in session.get("new_item_ids", []))
 
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -284,6 +355,7 @@ def save_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> Pa
                 "group_key",
                 "class_label",
                 "split_label",
+                "is_new",
             ],
         )
         writer.writeheader()
@@ -297,6 +369,7 @@ def save_assignment_csv(session: dict[str, Any], items: list[DatasetItem]) -> Pa
                     "group_key": item.group_key,
                     "class_label": str(labels.get(item.item_id, "")),
                     "split_label": str(splits.get(item.item_id, "")),
+                    "is_new": "1" if item.item_id in new_item_ids else "",
                 }
             )
     return csv_path
@@ -312,8 +385,26 @@ def preview_split(
 
     merged: dict[str, str] = {}
     split_labels = [str(v) for v in split.get("split_labels", [])]
+
+    # Identify groups that should be excluded from training (mutual exclusion)
+    # If an original/bad image from a group is assigned to a non-discard split,
+    # we should probably not use the repaired version for training.
+    excluded_groups: set[str] = set()
     for item in items:
         assigned = split_assignments.get(item.item_id, auto.get(item.item_id, ""))
+        label = labels.get(item.item_id, "")
+        # If explicitly assigned to a test/val split or has a defect label
+        if assigned in {"test", "val"} or (label and label != "good"):
+            if "repair" not in item.section.lower():
+                excluded_groups.add(item.group_key)
+
+    for item in items:
+        assigned = split_assignments.get(item.item_id, auto.get(item.item_id, ""))
+
+        # Apply mutual exclusion: if group is excluded and this is a repaired image, discard it.
+        if item.group_key in excluded_groups and "repair" in item.section.lower():
+            assigned = "discard"
+
         if assigned:
             merged[item.item_id] = assigned
 
@@ -369,6 +460,7 @@ def session_snapshot(session: dict[str, Any], items: list[DatasetItem], preview:
     assignments = dict(preview.get("assignments", {}))
     explicit = dict(session.get("split_assignments", {}))
     labels = dict(session.get("labels", {}))
+    new_item_ids = set(str(item_id) for item_id in session.get("new_item_ids", []))
 
     payload_items = []
     for item in items:
@@ -382,6 +474,7 @@ def session_snapshot(session: dict[str, Any], items: list[DatasetItem], preview:
                 "group_key": item.group_key,
                 "selected_split": selected_split,
                 "selected_label": labels.get(item.item_id, ""),
+                "is_new": item.item_id in new_item_ids,
             }
         )
 
@@ -394,6 +487,7 @@ def session_snapshot(session: dict[str, Any], items: list[DatasetItem], preview:
         "config": session.get("config", {}),
         "labels": labels,
         "split_assignments": explicit,
+        "new_item_ids": sorted(new_item_ids),
         "csv_loaded": bool(session.get("csv_loaded", False)),
         "items": payload_items,
     }
@@ -413,6 +507,7 @@ def _render_output_path(template: str, split_label: str, class_label: str, item:
         template.replace("{split_label}", split_label)
         .replace("{class_label}", class_label)
         .replace("{image_file}", Path(item.image_path).name)
+        .replace("{mask_file}", Path(item.image_path).name)
     )
 
 
@@ -433,13 +528,36 @@ def export_dataset(
             split_path = output_dir / split_text
             if split_path.exists() or split_path.is_symlink():
                 _safe_unlink(split_path)
+        
+        # Also clean up ground_truth dir if it exists
+        gt_path = output_dir / "ground_truth"
+        if gt_path.exists():
+            _safe_unlink(gt_path)
+
+    # Ensure all split/class directory combinations exist (Anomalib requirement)
+    split_labels = [str(v) for v in session.get("split", {}).get("split_labels", [])]
+    class_labels = [str(v) for v in session.get("config", {}).get("class_labels", [])]
+    for split_name in split_labels:
+        if split_name == "discard":
+            continue
+        for class_name in class_labels:
+            (output_dir / split_name / class_name).mkdir(parents=True, exist_ok=True)
+    
+    # Also ensure ground_truth/defect exists
+    (output_dir / "ground_truth" / "defect").mkdir(parents=True, exist_ok=True)
 
     output_tree = dict(session.get("config", {}).get("output_tree_structure", {}))
     image_template = str(output_tree.get("images", "{split_label}/{class_label}/{image_file}"))
+    mask_template = str(output_tree.get("masks", "ground_truth/{class_label}/{mask_file}"))
 
     labels = session.setdefault("labels", {})
     explicit_splits = session.setdefault("split_assignments", {})
     all_assignments = dict(preview.get("assignments", {}))
+
+    # Index items by group_key and section to find masks easily
+    items_by_group: dict[str, dict[str, DatasetItem]] = {}
+    for item in items:
+        items_by_group.setdefault(item.group_key, {})[item.section] = item
 
     counts: dict[str, dict[str, int]] = {}
     for item in items:
@@ -456,9 +574,30 @@ def export_dataset(
             _safe_unlink(target_path)
         target_path.symlink_to(Path(item.image_path))
 
+        # Handle mask if this is a defect
+        if class_label == "defect":
+            # Try to find a mask for this group
+            group_sections = items_by_group.get(item.group_key, {})
+            # Prefer masks from the 'masks' section, but fallback to any section containing 'mask'
+            mask_item = group_sections.get("masks")
+            if not mask_item:
+                for sec_name, sec_item in group_sections.items():
+                    if "mask" in sec_name.lower() and sec_name != item.section:
+                        mask_item = sec_item
+                        break
+            
+            if mask_item:
+                mask_target_rel = _render_output_path(mask_template, split_name, class_label, item)
+                mask_target_path = output_dir / mask_target_rel
+                mask_target_path.parent.mkdir(parents=True, exist_ok=True)
+                if mask_target_path.exists() or mask_target_path.is_symlink():
+                    _safe_unlink(mask_target_path)
+                mask_target_path.symlink_to(Path(mask_item.image_path))
+
         bucket = counts.setdefault(split_name, {})
         bucket[class_label] = bucket.get(class_label, 0) + 1
 
+    session["new_item_ids"] = []
     snapshot = session_snapshot(session, items, preview)
     summary = {
         "counts": counts,
@@ -471,8 +610,10 @@ def export_dataset(
     summary_path = output_dir / SUMMARY_FILE
     session_path.write_text(yaml.safe_dump(snapshot, sort_keys=False, allow_unicode=True), encoding="utf-8")
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    
+    # Save a copy of the inventory CSV in the output directory
     save_assignment_csv(session, items)
-
+    
     return summary
 
 
@@ -491,7 +632,7 @@ def execute_headless(contract: dict[str, Any], contract_path: Path | None = None
     session = derive_session_from_contract(contract, contract_path)
     items = scan_dataset_items(session["input_sections"], class_labels=session["config"]["class_labels"])
 
-    csv_found = load_assignment_csv(session, items)
+    csv_found = merge_assignment_inventory(session, items)["csv_found"]
     if not csv_found:
         csv_path = session["paths"]["assignment_csv"]
         raise FileNotFoundError(f"headless mode requires existing CSV at {csv_path}")
@@ -504,12 +645,9 @@ def execute_web_setup(contract: dict[str, Any], contract_path: Path | None = Non
     session = derive_session_from_contract(contract, contract_path)
     items = scan_dataset_items(session["input_sections"], class_labels=session["config"]["class_labels"])
 
-    csv_found = load_assignment_csv(session, items)
-    if not csv_found:
-        initial = initialize_split_assignments(items, session["split"])
-        session["split_assignments"].update(initial)
-
+    merge_assignment_inventory(session, items)
     preview = preview_split(items, session["labels"], session["split"], session["split_assignments"])
+    save_assignment_csv(session, items)
     return session, items, preview
 
 
@@ -526,6 +664,7 @@ __all__ = [
     "export_dataset",
     "initialize_split_assignments",
     "load_assignment_csv",
+    "merge_assignment_inventory",
     "preview_split",
     "save_assignment_csv",
     "save_dataset",
